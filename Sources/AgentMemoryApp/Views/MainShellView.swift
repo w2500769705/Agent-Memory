@@ -38,6 +38,12 @@ struct MainShellView: View {
                 }
 
                 topToolbarFadeOverlay
+
+                WindowDragRegion()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 62)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .ignoresSafeArea(edges: .top)
             }
             .frame(minWidth: 480)
             .background(theme.canvasBackground, ignoresSafeAreaEdges: .all)

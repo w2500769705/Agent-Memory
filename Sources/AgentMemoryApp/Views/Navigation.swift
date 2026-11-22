@@ -132,6 +132,39 @@ extension AppModel {
     }
 }
 
+struct WindowDragRegion: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        WindowDragNSView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class WindowDragNSView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else {
+            super.mouseDown(with: event)
+            return
+        }
+        if event.clickCount == 2 {
+            switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+            case "Minimize":
+                window.performMiniaturize(nil)
+            case "None":
+                break
+            default:
+                window.performZoom(nil)
+            }
+        } else {
+            window.performDrag(with: event)
+        }
+    }
+}
+
 struct WindowCloseInterceptor: NSViewRepresentable {
     let model: AppModel
     let appDelegate: AppLifecycleDelegate
