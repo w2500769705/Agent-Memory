@@ -4,6 +4,8 @@ import SwiftUI
 @MainActor
 private final class ShellState: ObservableObject {
     @Published var selection: AppPage = .overview
+    @Published var setupAgent: AgentBrand = .codex
+    @Published var filterDormantOnly = false
     @Published var pickedDecision: Decision?
     @Published var pendingUndo: String?
     @Published var showBackfill = false
@@ -71,8 +73,25 @@ struct MainShellView: View {
             if selection != .dream {
                 state.pickedDecision = nil
             }
+            if selection != .memory {
+                state.filterDormantOnly = false
+            }
+            // Auto-collapse right inspector on tab switch unless triggered by a pending inspect-memory jump.
+            if state.pendingInspectMemoryID == nil {
+                state.inspectorPresented = false
+            }
             if selection == .memory {
                 model.find()
+            }
+        }
+        .onChange(of: state.showBackfill) { _, isShown in
+            if isShown {
+                state.inspectorPresented = false
+            }
+        }
+        .onChange(of: state.pendingUndo) { _, batchID in
+            if batchID != nil {
+                state.inspectorPresented = false
             }
         }
         .onChange(of: model.hits.map(\.id)) { _, _ in
@@ -215,11 +234,18 @@ struct MainShellView: View {
             OverviewView(
                 model: model,
                 selection: $state.selection,
-                onFocusSearch: { focusMemorySearch() },
-                onInspectMemoryID: { memoryID in inspectMemory(id: memoryID) }
+                onSearchMemory: { query in searchFromOverview(query) },
+                onInspectMemoryID: { memoryID in inspectMemory(id: memoryID) },
+                onOpenAgentSettings: { agent in openAgentSettings(agent) },
+                onInspectDormantMemories: { inspectDormantMemories() },
+                onNonDetailAction: { state.inspectorPresented = false }
             )
         case .memory:
-            MemoryListView(model: model, searchFocused: $searchFocused) { hit in
+            MemoryListView(
+                model: model,
+                searchFocused: $searchFocused,
+                filterDormantOnly: $state.filterDormantOnly
+            ) { hit in
                 model.show(hit)
                 state.inspectorPresented = true
             }
@@ -238,7 +264,11 @@ struct MainShellView: View {
                 inspectMemory(id: memoryID)
             }
         case .settings:
-            SettingsView(model: model, showBackfill: $state.showBackfill)
+            SettingsView(
+                model: model,
+                showBackfill: $state.showBackfill,
+                selectedAgent: $state.setupAgent
+            )
         }
     }
 
@@ -299,15 +329,52 @@ struct MainShellView: View {
         }
     }
 
+    // MARK: - Navigation & Inspector Actions
+
     private func focusMemorySearch() {
+        state.pendingInspectMemoryID = nil
+        state.inspectorPresented = false
         state.selection = .memory
         DispatchQueue.main.async {
             searchFocused = true
         }
     }
 
+    private func searchFromOverview(_ query: String) {
+        state.pendingInspectMemoryID = nil
+        state.filterDormantOnly = false
+        model.query = query
+        state.inspectorPresented = false
+        state.selection = .memory
+        DispatchQueue.main.async {
+            searchFocused = true
+        }
+    }
+
+    private func openAgentSettings(_ agent: AgentBrand) {
+        state.pendingInspectMemoryID = nil
+        state.setupAgent = agent
+        state.inspectorPresented = false
+        state.selection = .settings
+    }
+
+    private func inspectDormantMemories() {
+        state.pendingInspectMemoryID = nil
+        model.query = ""
+        model.projectFilter = false
+        state.filterDormantOnly = true
+        state.inspectorPresented = false
+        state.selection = .memory
+    }
+
     private func inspectMemory(id memoryID: String) {
         if let hit = model.hits.first(where: { $0.id == memoryID }) {
+            model.show(hit)
+            state.inspectorPresented = true
+            return
+        }
+        if let directMemory = try? model.memory(id: memoryID, version: nil) {
+            let hit = SearchHit(memory: directMemory, vector: nil, keywordRank: nil, score: 0)
             model.show(hit)
             state.inspectorPresented = true
             return
