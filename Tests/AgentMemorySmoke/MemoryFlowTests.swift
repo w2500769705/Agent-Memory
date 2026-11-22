@@ -25,7 +25,9 @@ struct MemoryFlowTests {
         try tests.testLegacyMemoryStatisticsMigration()
         try tests.testVectorCacheInspectionAndMemoryHealth()
         try tests.testDreamBatchSummariesAndLookups()
-        print("通过 19 项冒烟测试")
+        try tests.testMemoryGraph()
+        try tests.testCrossAgentMemoryPulses()
+        print("通过 21 项冒烟测试")
     }
 
     let project = "/tmp/agent-memory-demo"
@@ -875,6 +877,163 @@ struct MemoryFlowTests {
         expectEqual(try store.dreamBatchSummaries().first?.canRollback, false)
         expectEqual(try store.memory(id: active.id)?.archived, true)
         expectEqual(try store.memory(id: active.id, version: 1)?.archived, false)
+    }
+
+    func testMemoryGraph() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let path = folder.appendingPathComponent("db").path
+        let store = try MemoryStore(path: path)
+        expectTrue(try store.memoryGraph().nodes.isEmpty)
+        let shared = proof(1, text: "Android 发布记录。")
+        let duplicate = proof(2, text: "拓竹打印机的校准记录。")
+        let semantic = proof(3, text: "Jellyfin 的媒体索引记录。")
+        let archived = proof(4, text: "macOS 应用的签名记录。")
+        try store.ingest([shared, duplicate, semantic, archived])
+        let batch = try unwrap(store.getBatch(project: project))
+        _ = try store.submit(batchID: batch.id, proposals: [
+            add(shared, title: "发布 APK", body: "用已有项目签名。"),
+            add(duplicate, title: "打印机校准", body: "打印首层前校准。"),
+            add(semantic, title: "媒体索引", body: "定期刷新媒体库。"),
+            add(shared, title: "发布备份", body: "保留归档和校验文件。"),
+            add(archived, title: "macOS 签名", body: "签名后校验产物。")
+        ])
+        let memories = try store.search("").map(\.memory)
+        let first = try unwrap(memories.first { $0.title == "发布 APK" })
+        let second = try unwrap(memories.first { $0.title == "打印机校准" })
+        let third = try unwrap(memories.first { $0.title == "媒体索引" })
+        let fourth = try unwrap(memories.first { $0.title == "发布备份" })
+        let excluded = try unwrap(memories.first { $0.title == "macOS 签名" })
+        let base = try storedVector(for: first.id, path: path)
+        try setSimilarity(0.89, relativeTo: base, memoryID: second.id, path: path)
+        try setSimilarity(0.62, relativeTo: base, memoryID: third.id, path: path)
+        let now = Date().timeIntervalSince1970
+        let aged = now - 31 * 86_400
+        try executeSQLite("""
+            UPDATE memory SET hit_count = 2, last_hit_at = \(now), updated = \(aged) WHERE id = '\(first.id)';
+            UPDATE memory SET updated = \(aged) WHERE id = '\(third.id)';
+            UPDATE memory SET vectors = NULL WHERE id = '\(fourth.id)';
+            UPDATE memory SET archived = 1, hit_count = 100 WHERE id = '\(excluded.id)';
+            WITH RECURSIVE filler(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM filler WHERE n < 304)
+            INSERT INTO memory (id, archived, updated, payload)
+            SELECT 'filler-' || n, 0, n, CAST(json_object(
+                'id', 'filler-' || n, 'version', 1, 'title', '备用条目', 'body', '备用内容',
+                'archived', json('false'), 'evidenceIDs', json('[]'), 'updated', n) AS BLOB)
+            FROM filler;
+            """, path: path)
+
+        let graph = try store.memoryGraph()
+        expectEqual(graph.nodes.count, 300)
+        expectFalse(graph.nodes.contains { $0.id == excluded.id || $0.id == "filler-1" })
+        expectTrue(graph.nodes.contains { $0.id == "filler-304" && $0.scope == "global" && $0.project == nil })
+        expectEqual(graph.nodes.first?.id, first.id)
+        expectEqual(graph.nodes.first?.project, project)
+        expectEqual(graph.nodes.first?.scope, "project")
+        expectEqual(graph.nodes.first?.hitCount, 2)
+        expectEqual(graph.nodes.first?.evidenceCount, 1)
+        expectTrue((graph.nodes.first?.freshness ?? 0) > 0.99)
+        expectEqual(graph.nodes.first?.isDormant, false)
+        let dormant = try unwrap(graph.nodes.first { $0.id == third.id })
+        expectEqual(dormant.isDormant, true)
+        expectEqual(dormant.freshness, 0)
+        expectEqual(dormant.updated, aged)
+        expectTrue(graph.generatedAt.timeIntervalSince1970 >= now)
+        let includedIDs = Set(graph.nodes.map(\.id))
+        expectTrue(graph.edges.allSatisfy {
+            includedIDs.contains($0.sourceID) && includedIDs.contains($0.targetID) && $0.sourceID < $0.targetID
+        })
+        expectEqual(Set(graph.edges.map(\.id)).count, graph.edges.count)
+
+        func edge(to target: String, kind: MemoryGraphEdge.Kind) throws -> MemoryGraphEdge {
+            try unwrap(graph.edges.first {
+                $0.sourceID == min(first.id, target) && $0.targetID == max(first.id, target) && $0.kind == kind
+            })
+        }
+        expectTrue(abs(try edge(to: second.id, kind: .duplicate).weight - 0.89) < 0.001)
+        expectTrue(abs(try edge(to: third.id, kind: .semantic).weight - 0.62) < 0.001)
+        expectEqual(try edge(to: fourth.id, kind: .sharedEvidence).weight, 1)
+        expectEqual(try store.memoryGraph().edges, graph.edges)
+
+        // Reuse a warm cache and verify the revision invalidates changed graph edges.
+        try setSimilarity(0.20, relativeTo: base, memoryID: third.id, path: path)
+        let rebuilt = try store.memoryGraph()
+        expectFalse(rebuilt.edges.contains {
+            ($0.sourceID == first.id && $0.targetID == third.id) ||
+            ($0.sourceID == third.id && $0.targetID == first.id)
+        })
+
+        // Five tied neighbors form nine undirected links when each node nominates three.
+        try executeSQLite("""
+            UPDATE memory SET vectors = (SELECT vectors FROM memory WHERE id = '\(first.id)')
+            WHERE id IN ('filler-300', 'filler-301', 'filler-302', 'filler-303');
+            """, path: path)
+        let cluster = Set([first.id, "filler-300", "filler-301", "filler-302", "filler-303"])
+        let clusterEdges = try store.memoryGraph().edges.filter {
+            cluster.contains($0.sourceID) && cluster.contains($0.targetID)
+        }
+        expectEqual(clusterEdges.count, 9)
+        expectTrue(clusterEdges.allSatisfy { $0.kind == .duplicate })
+    }
+
+    func testCrossAgentMemoryPulses() throws {
+        let folder = URL(fileURLWithPath: "/tmp/am-" + String(UUID().uuidString.prefix(10)))
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let socket = folder.appendingPathComponent("mcp.sock")
+        let store = try MemoryStore(path: ":memory:")
+        let source = proof(1, text: "Android release APK 使用项目签名。")
+        try store.ingest([source])
+        let batch = try unwrap(store.getBatch(project: project))
+        _ = try store.submit(batchID: batch.id, proposals: [
+            add(source, title: "Android release APK", body: "使用项目签名。")
+        ])
+        let memoryID = try unwrap(store.search("").first?.id)
+
+        final class PulseLog: @unchecked Sendable {
+            let lock = NSLock()
+            var events: [ActivityEvent] = []
+            func append(_ event: ActivityEvent) { lock.withLock { events.append(event) } }
+            func snapshot() -> [ActivityEvent] { lock.withLock { events } }
+        }
+        let log = PulseLog()
+        let completed = DispatchSemaphore(value: 0)
+        let server = try LocalToolServer(store: store, path: socket, onMemoryHit: { log.append($0) },
+                                         onChange: { completed.signal() })
+        try withExtendedLifetime(server) {
+            func request(_ name: String, arguments: [String: Any] = [:], agent: String? = nil) throws {
+                var message: [String: Any] = ["name": name, "arguments": arguments]
+                message["agent"] = agent
+                let payload = try JSONSerialization.data(withJSONObject: message)
+                let result = try LocalConnection.call(payload, socket: socket)
+                expectFalse(String(decoding: result, as: UTF8.self).contains("toolError"))
+                expectEqual(completed.wait(timeout: .now() + .seconds(2)), .success)
+            }
+
+            let query = "Android release APK"
+            for agent in ["codex", "antigravity"] {
+                try request("_configure_recall", arguments: ["enabled": true, "agent": agent])
+                try request("_recall_context", arguments: [
+                    "query": query, "project": project, "threadID": "shared", "agent": agent
+                ])
+                try request("_recall_context", arguments: [
+                    "query": query, "project": project, "threadID": "shared", "agent": agent
+                ])
+                try request("memory_search", arguments: ["query": query, "project": project], agent: agent)
+            }
+            try request("memory_search", arguments: ["query": query, "project": "/tmp/unrelated"], agent: "codex")
+            try request("memory_search", arguments: ["query": ""])
+            try request("memory_search", arguments: ["query": AntigravitySetup.verifyQuery], agent: "antigravity")
+            _ = try store.search(query)
+            let events = log.snapshot()
+            expectEqual(events.map(\.kind), [.recall, .search, .recall, .search])
+            expectEqual(events.map(\.agent), [.codex, .codex, .antigravity, .antigravity])
+            expectTrue(events.allSatisfy { $0.memoryIDs == [memoryID] && $0.count == 1 })
+            let persisted = try store.recentActivities().filter { !$0.memoryIDs.isEmpty }
+            expectEqual(persisted.map(\.id), Array(events.reversed()).map(\.id))
+            expectEqual(try store.memory(id: memoryID)?.hitCount, events.count)
+        }
     }
 
     private struct StoredVector: Codable {

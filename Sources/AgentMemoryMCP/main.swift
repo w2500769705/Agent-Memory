@@ -75,6 +75,7 @@ func toolResult(_ data: Data) throws -> [String: Any] {
 }
 
 let supportedVersions = ["2025-03-26", "2025-06-18", "2025-11-25"]
+var clientAgent: ActivityEvent.Agent?
 while let line = readLine() {
     guard line.utf8.count <= 2_000_000,
           let message = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
@@ -84,6 +85,11 @@ while let line = readLine() {
     var envelope: [String: Any] = ["jsonrpc": "2.0", "id": id]
     switch method {
     case "initialize":
+        let clientInfo = params["clientInfo"] as? [String: Any]
+        let clientName = (clientInfo?["name"] as? String)?.lowercased() ?? ""
+        if clientName.contains("antigravity") { clientAgent = .antigravity }
+        else if clientName.contains("codex") { clientAgent = .codex }
+        else { clientAgent = nil }
         let requested = params["protocolVersion"] as? String ?? ""
         envelope["result"] = [
             "protocolVersion": supportedVersions.contains(requested) ? requested : supportedVersions[2],
@@ -99,8 +105,10 @@ while let line = readLine() {
                   ["dream_get_batch", "dream_submit", "memory_search"].contains(name) else {
                 throw MemoryError.invalid("未知工具。")
             }
-            let request = try JSONSerialization.data(withJSONObject: params)
-            envelope["result"] = try toolResult(LocalConnection.call(request, socket: socket))
+            var request = params
+            request["agent"] = clientAgent?.rawValue
+            let data = try JSONSerialization.data(withJSONObject: request)
+            envelope["result"] = try toolResult(LocalConnection.call(data, socket: socket))
         } catch {
             envelope["result"] = ["isError": true, "content": [["type": "text", "text": error.localizedDescription]]]
         }

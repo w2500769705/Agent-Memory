@@ -56,13 +56,15 @@ public enum MCPTools {
         onClaim: (String) -> Void = { _ in }
     ) throws -> Data {
         var response = Data()
-        try respond(data, store: store, beforeDream: beforeDream, onClaim: onClaim) { response = $0 }
+        try respond(data, store: store, beforeDream: beforeDream, onClaim: onClaim, onMemoryHit: { _ in }) {
+            response = $0
+        }
         return response
     }
 
     static func respond(
         _ data: Data, store: MemoryStore, beforeDream: (@Sendable () -> Void)?,
-        onClaim: (String) -> Void, send: (Data) throws -> Void
+        onClaim: (String) -> Void, onMemoryHit: (ActivityEvent) -> Void, send: (Data) throws -> Void
     ) throws {
         guard let message = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let name = message["name"] as? String else { throw MemoryError.invalid("无法读取工具请求。") }
@@ -83,10 +85,12 @@ public enum MCPTools {
             guard let query = arguments.query, let project = arguments.project else {
                 return try send(Wire.data(["context": ""]))
             }
-            return try store.recallContext(query: query, project: project, threadID: arguments.threadID ?? "",
-                                           agent: arguments.agent ?? "codex") {
+            let event = try store.recallContext(query: query, project: project, threadID: arguments.threadID ?? "",
+                                                agent: arguments.agent ?? "codex") {
                 try send(Wire.data(["context": $0]))
             }
+            if let event { onMemoryHit(event) }
+            return
         case "dream_get_batch":
             if arguments.batchID == nil { beforeDream?() }
             if let batch = try store.getBatch(project: arguments.project, limit: arguments.limit ?? 4,
@@ -112,7 +116,10 @@ public enum MCPTools {
             let hits = try store.search(query, project: arguments.project, limit: arguments.limit ?? 20, recordActivity: false)
             let payload = try Wire.data(SearchResponse(hits: hits.map(SearchMatch.init)))
             guard !trimmed.isEmpty else { return try send(payload) }
-            return try store.deliverSearch(hits, project: arguments.project) { try send(payload) }
+            let agent = (message["agent"] as? String).flatMap(ActivityEvent.Agent.init(rawValue:))
+            let event = try store.deliverSearch(hits, project: arguments.project, agent: agent) { try send(payload) }
+            if !event.memoryIDs.isEmpty { onMemoryHit(event) }
+            return
         default:
             throw MemoryError.invalid("未知工具。")
         }
@@ -235,6 +242,7 @@ public final class LocalToolServer {
 
     public init(store: MemoryStore, path: URL = MemoryPaths.socket,
                 beforeDream: (@Sendable () -> Void)? = nil,
+                onMemoryHit: @escaping @Sendable (ActivityEvent) -> Void = { _ in },
                 onChange: @escaping @Sendable () -> Void = {}) throws {
         self.path = path
         var address = try LocalConnection.checkedAddress(path)
@@ -269,7 +277,10 @@ public final class LocalToolServer {
                 let client = Darwin.accept(fd, nil, nil)
                 if client < 0 && errno == EINTR { continue }
                 guard client >= 0 else { break }
-                self.work.async { Self.handle(client, store: store, beforeDream: beforeDream, onChange: onChange) }
+                self.work.async {
+                    Self.handle(client, store: store, beforeDream: beforeDream,
+                                onMemoryHit: onMemoryHit, onChange: onChange)
+                }
             }
         }
         source.setCancelHandler { close(fd); _ = unlink(path.path); close(lockFD) }
@@ -278,7 +289,8 @@ public final class LocalToolServer {
 
     deinit { source.cancel() }
 
-    private static func handle(_ fd: Int32, store: MemoryStore, beforeDream: (@Sendable () -> Void)?, onChange: @Sendable () -> Void) {
+    private static func handle(_ fd: Int32, store: MemoryStore, beforeDream: (@Sendable () -> Void)?,
+                               onMemoryHit: @Sendable (ActivityEvent) -> Void, onChange: @Sendable () -> Void) {
         defer { close(fd) }
         var uid = uid_t.max
         var gid = gid_t.max
@@ -294,7 +306,8 @@ public final class LocalToolServer {
         }
         do {
             let input = try LocalConnection.readLine(fd: fd)
-            try MCPTools.respond(input, store: store, beforeDream: beforeDream, onClaim: { newClaim = $0 }) { payload in
+            try MCPTools.respond(input, store: store, beforeDream: beforeDream, onClaim: { newClaim = $0 },
+                                 onMemoryHit: onMemoryHit) { payload in
                 try LocalConnection.writeLine(payload, fd: fd)
                 delivered = true
             }

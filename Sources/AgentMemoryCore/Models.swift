@@ -122,6 +122,50 @@ public struct MemoryHealthSummary: Equatable, Sendable {
     }
 }
 
+public struct MemoryGraph: Equatable, Sendable {
+    public let nodes: [MemoryGraphNode]
+    public let edges: [MemoryGraphEdge]
+    public let generatedAt: Date
+
+    public init(nodes: [MemoryGraphNode] = [], edges: [MemoryGraphEdge] = [], generatedAt: Date = .distantPast) {
+        self.nodes = nodes
+        self.edges = edges
+        self.generatedAt = generatedAt
+    }
+}
+
+public struct MemoryGraphNode: Equatable, Identifiable, Sendable {
+    public let id: String
+    public let title: String
+    public let scope: String
+    public let project: String?
+    public let hitCount: Int
+    public let updated: Double
+    public let freshness: Double
+    public let evidenceCount: Int
+    public let isDormant: Bool
+}
+
+public struct MemoryGraphEdge: Equatable, Identifiable, Sendable {
+    public enum Kind: String, Sendable {
+        case semantic, duplicate, sharedEvidence
+    }
+
+    public let id: String
+    public let sourceID: String
+    public let targetID: String
+    public let kind: Kind
+    public let weight: Double
+
+    init(_ firstID: String, _ secondID: String, kind: Kind, weight: Double) {
+        sourceID = min(firstID, secondID)
+        targetID = max(firstID, secondID)
+        id = "\(kind.rawValue):\(sourceID):\(targetID)"
+        self.kind = kind
+        self.weight = weight
+    }
+}
+
 public enum Operation: String, Codable, Sendable { case add, update, archive, skip }
 
 public struct Proposal: Codable, Sendable {

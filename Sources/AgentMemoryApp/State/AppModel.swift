@@ -38,6 +38,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var todayRecallEstimatedTokens: Int = 0
     @Published private(set) var runtimeHealth = RuntimeHealth()
     @Published private(set) var healthSummary: MemoryHealthSummary = MemoryHealthSummary()
+    @Published private(set) var memoryGraph = MemoryGraph()
+    @Published private(set) var lastPulseMemoryIDs: [String] = []
+    @Published private(set) var lastPulseAgent: ActivityEvent.Agent?
+    @Published private(set) var lastPulseAt: Date?
     @Published var hits: [SearchHit] = []
     @Published var evidence: [Evidence] = []
     @Published var history: [HistoryItem] = []
@@ -112,6 +116,9 @@ final class AppModel: ObservableObject {
                     beforeDream: {
                         _ = try? CodexSource.scan(store: store, force: false)
                         _ = try? AntigravitySource.scan(store: store)
+                    },
+                    onMemoryHit: { [weak self] event in
+                        Task { @MainActor in self?.publishMemoryPulse(event) }
                     },
                     onChange: { [weak self] in
                         Task { @MainActor in
@@ -225,6 +232,7 @@ final class AppModel: ObservableObject {
         guard let store else { return }
         refreshActivities()
         refreshHealthSummary()
+        refreshMemoryGraph()
         defer { updateRuntimeHealth() }
         do {
             dashboard = try store.dashboard()
@@ -291,6 +299,40 @@ final class AppModel: ObservableObject {
                 self.error = error.localizedDescription
             }
         }
+    }
+
+    private var graphTask: Task<Void, Never>?
+    private var graphRefreshPending = false
+    private var lastPulseActivityID: Int64 = 0
+
+    func refreshMemoryGraph() {
+        guard let store else { return }
+        guard graphTask == nil else {
+            graphRefreshPending = true
+            return
+        }
+        graphTask = Task {
+            defer {
+                graphTask = nil
+                if graphRefreshPending {
+                    graphRefreshPending = false
+                    refreshMemoryGraph()
+                }
+            }
+            do {
+                memoryGraph = try await Task.detached(priority: .utility) { try store.memoryGraph() }.value
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    private func publishMemoryPulse(_ event: ActivityEvent) {
+        guard event.id > lastPulseActivityID else { return }
+        lastPulseActivityID = event.id
+        lastPulseMemoryIDs = event.memoryIDs
+        lastPulseAgent = event.agent
+        lastPulseAt = event.timestamp
     }
 
     func inspectSearch(_ query: String, scope: SearchScope = .all, limit: Int = 20,
@@ -656,6 +698,7 @@ final class AppModel: ObservableObject {
             embeddingReady = ready
             embeddingState = ready ? .ready : .unavailable
             refreshHealthSummary()
+            if ready { refreshMemoryGraph() }
         } catch {
             embeddingReady = false
             embeddingState = .failed

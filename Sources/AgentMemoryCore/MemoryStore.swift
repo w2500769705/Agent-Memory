@@ -24,6 +24,7 @@ public final class MemoryStore: @unchecked Sendable {
     private static let recallTurnWindow = 12
     private static let recallTimeWindow: TimeInterval = 45 * 60
     private static let maxRecallSessions = 512
+    private static let dormantAge: TimeInterval = 30 * 86_400
 
     private let recallDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -152,26 +153,31 @@ public final class MemoryStore: @unchecked Sendable {
     }
 
     func recallContext(query: String, project: String, threadID: String, agent: String = "codex",
-                       deliver: (String) throws -> Void) throws {
+                       deliver: (String) throws -> Void) throws -> ActivityEvent? {
+        func noRecall() throws -> ActivityEvent? {
+            try deliver("")
+            return nil
+        }
         let deadline = DispatchTime.now() + .milliseconds(1_900)
         let project = ProjectIdentity.resolve(project)
         let agent = ActivityEvent.Agent(rawValue: agent) ?? .codex
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !project.isEmpty, !query.isEmpty, query.count <= 1_000, !SecretFilter.contains(query) else { return try deliver("") }
+        guard !project.isEmpty, !query.isEmpty, query.count <= 1_000, !SecretFilter.contains(query) else { return try noRecall() }
         if agent == .antigravity, !threadID.isEmpty {
             let key = "antigravityProject:\(threadID)"
             if (try? setting(key)) != project { try? setSetting(key, project) }
         }
-        guard !RecallHook.isLowInformation(query) else { return try deliver("") }
+        guard !RecallHook.isLowInformation(query) else { return try noRecall() }
         recallLock.lock()
         defer { recallLock.unlock() }
-        guard DispatchTime.now() < deadline else { return try deliver("") }
+        guard DispatchTime.now() < deadline else { return try noRecall() }
         let enabledKey = agent == .antigravity ? "antigravityRecallEnabled" : "recallEnabled"
         let verifiedKey = agent == .antigravity ? "antigravityRecallVerifiedAt" : "recallVerifiedAt"
-        guard try setting(enabledKey) == "1" else { return try deliver("") }
+        guard try setting(enabledKey) == "1" else { return try noRecall() }
         if query == CodexSetup.testPrompt || query == AntigravitySetup.testPrompt {
             try setSetting(verifiedKey, String(Date().timeIntervalSince1970))
-            return try deliver("Agent Memory 的验证请求已收到。本次为连接测试，未检索个人记忆。请用户到 Agent Memory 概览查看确认状态。")
+            try deliver("Agent Memory 的验证请求已收到。本次为连接测试，未检索个人记忆。请用户到 Agent Memory 概览查看确认状态。")
+            return nil
         }
 
         let now = Date()
@@ -197,11 +203,12 @@ public final class MemoryStore: @unchecked Sendable {
             return try search(db, query, scope: crossProject ? .all : .projectAndGlobal(project), limit: 3,
                               requireRecallRelevance: true).hits
         }
-        guard DispatchTime.now() < deadline else { return try deliver("") }
+        guard DispatchTime.now() < deadline else { return try noRecall() }
         let selected = relevant.prefix(3).filter { session.injected[$0.id]?.version != $0.memory.version }.map(\.memory)
 
+        let activity: ActivityEvent?
         if selected.isEmpty {
-            try deliver("")
+            activity = try noRecall()
         } else {
             let notes = selected.map { memory -> String in
                 let date = recallDateFormatter.string(from: Date(timeIntervalSince1970: memory.updated))
@@ -210,20 +217,17 @@ public final class MemoryStore: @unchecked Sendable {
             let context: String = "Agent Memory 检索到的历史参考。用户本轮要求优先。历史记忆若有冲突，以较新日期为准，并与实际情况核对。\n" + notes
             let ascii = context.unicodeScalars.filter(\.isASCII).count
             let tokens = (ascii + 3) / 4 + context.unicodeScalars.count - ascii
-            let delivered = try database.write { db in
-                guard DispatchTime.now() < deadline else {
-                    try deliver("")
-                    return false
-                }
+            activity = try database.write { db in
+                guard DispatchTime.now() < deadline else { return try noRecall() }
                 let ids = selected.map(\.id)
                 try Self.recordHits(db, ids: ids)
-                try Self.insertActivity(db, .recall, agent: agent, project: project,
-                                        memoryIDs: ids, count: ids.count, estimatedTokens: tokens)
+                let event = try Self.insertActivity(db, .recall, agent: agent, project: project,
+                                                    memoryIDs: ids, count: ids.count, estimatedTokens: tokens)
                 // A failed socket write rolls back both the hit counters and the activity.
                 try deliver(context)
-                return true
+                return event
             }
-            guard delivered else { return }
+            guard activity != nil else { return nil }
         }
 
         if !threadID.isEmpty {
@@ -234,6 +238,7 @@ public final class MemoryStore: @unchecked Sendable {
             }
             recallSessions[sessionKey] = session
         }
+        return activity
     }
 
     public func recentActivities(limit: Int = 50) throws -> [ActivityEvent] {
@@ -276,19 +281,24 @@ public final class MemoryStore: @unchecked Sendable {
         let nsError = error as NSError
         let detail = (error as? MemoryError)?.localizedDescription ?? "\(nsError.domain) (\(nsError.code))"
         let message = SecretFilter.contains(detail) ? operation : "\(operation)：\(detail)"
-        try? database.write { try Self.insertActivity($0, .error, agent: agent, message: String(message.prefix(240))) }
+        _ = try? database.write { try Self.insertActivity($0, .error, agent: agent, message: String(message.prefix(240))) }
     }
 
+    @discardableResult
     private static func insertActivity(_ db: Database, _ kind: ActivityEvent.Kind, agent: ActivityEvent.Agent? = nil,
                                        project: String? = nil, memoryIDs: [String] = [], count: Int? = nil,
-                                       estimatedTokens: Int? = nil, batchID: String? = nil, message: String? = nil) throws {
+                                       estimatedTokens: Int? = nil, batchID: String? = nil, message: String? = nil) throws -> ActivityEvent {
         let ids = memoryIDs.isEmpty ? nil : try Wire.data(memoryIDs)
         let safeProject = project.flatMap { SecretFilter.contains($0) ? nil : $0 }
+        let timestamp = Date()
         try db.execute(sql: """
             INSERT INTO activity_log (kind,time,agent,project,memory_ids,count,estimated_tokens,batch_id,message)
             VALUES (?,?,?,?,?,?,?,?,?)
-            """, arguments: [kind.rawValue, Date().timeIntervalSince1970, agent?.rawValue, safeProject, ids,
+            """, arguments: [kind.rawValue, timestamp.timeIntervalSince1970, agent?.rawValue, safeProject, ids,
                              count, estimatedTokens, batchID, message])
+        return ActivityEvent(id: db.lastInsertedRowID, kind: kind, timestamp: timestamp, agent: agent,
+                             project: safeProject, memoryIDs: memoryIDs, count: count,
+                             estimatedTokens: estimatedTokens, batchID: batchID, message: message)
     }
 
     public func setSetting(_ key: String, _ value: String) throws {
@@ -475,18 +485,20 @@ public final class MemoryStore: @unchecked Sendable {
     }
 
     private func recordSearch(count: Int, project: String?) {
-        try? database.write { db in
+        _ = try? database.write { db in
             try Self.insertActivity(db, .search, project: project.map(ProjectIdentity.resolve), count: count)
         }
     }
 
-    func deliverSearch(_ hits: [SearchHit], project: String?, deliver: () throws -> Void) throws {
+    func deliverSearch(_ hits: [SearchHit], project: String?, agent: ActivityEvent.Agent?,
+                       deliver: () throws -> Void) throws -> ActivityEvent {
         // An MCP page can be large. Let the peer drain the response without holding the database.
         try deliver()
         let scope = project.map(ProjectIdentity.resolve)
-        try database.write { db in
-            try Self.recordHits(db, ids: hits.map(\.id))
-            try Self.insertActivity(db, .search, project: scope, count: hits.count)
+        let ids = hits.map(\.id)
+        return try database.write { db in
+            try Self.recordHits(db, ids: ids)
+            return try Self.insertActivity(db, .search, agent: agent, project: scope, memoryIDs: ids, count: ids.count)
         }
     }
 
@@ -638,7 +650,7 @@ public final class MemoryStore: @unchecked Sendable {
     }
 
     public func memoryHealthSummary() throws -> MemoryHealthSummary {
-        let cutoff = Date().timeIntervalSince1970 - 30 * 86_400
+        let cutoff = Date().timeIntervalSince1970 - Self.dormantAge
         let (activeCount, archivedCount, dormantIDs, cachedPairs, candidates, revision) = try database.read { db in
             let activeCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memory WHERE archived = 0") ?? 0
             let archivedCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memory WHERE archived = 1") ?? 0
@@ -667,6 +679,74 @@ public final class MemoryStore: @unchecked Sendable {
         let pairs = cachedPairs ?? calculateDuplicatePairs(candidates, revision: revision)
         return MemoryHealthSummary(activeCount: activeCount, archivedCount: archivedCount,
                                    duplicatePairs: pairs, dormantMemoryIDs: dormantIDs)
+    }
+
+    public func memoryGraph() throws -> MemoryGraph {
+        let (records, vectors) = try database.read { db in
+            let records = try Row.fetchAll(db, sql: """
+                SELECT payload, updated, hit_count, last_hit_at FROM memory WHERE archived = 0
+                ORDER BY hit_count DESC, updated DESC, id LIMIT 300
+                """).map { (memory: try Self.memory($0), updated: $0["updated"] as Double) }
+            let cachedVectors = try activeVectors(db)
+            return (records, records.map { cachedVectors[$0.memory.id] })
+        }
+        let now = Date()
+        let timestamp = now.timeIntervalSince1970
+        let evidence = records.map { Set($0.memory.evidenceIDs) }
+        let nodes = records.enumerated().map { index, record in
+            let memory = record.memory
+            let lastActivity = max(record.updated, memory.lastHitAt ?? record.updated)
+            let age = max(0, timestamp - lastActivity)
+            return MemoryGraphNode(id: memory.id, title: memory.title, scope: memory.scope, project: memory.project,
+                                   hitCount: memory.hitCount, updated: record.updated,
+                                   freshness: max(0, 1 - age / Self.dormantAge), evidenceCount: evidence[index].count,
+                                   isDormant: memory.hitCount == 0 && record.updated < timestamp - Self.dormantAge)
+        }
+        let edges = Self.graphEdges(nodes: nodes, vectors: vectors, evidence: evidence)
+        return MemoryGraph(nodes: nodes, edges: edges, generatedAt: now)
+    }
+
+    private static func graphEdges(nodes: [MemoryGraphNode], vectors: [[Float]?],
+                                   evidence: [Set<String>]) -> [MemoryGraphEdge] {
+        typealias Neighbor = (index: Int, weight: Double)
+        var similar = [[Neighbor]](repeating: [], count: nodes.count)
+        var shared = [[Neighbor]](repeating: [], count: nodes.count)
+        for first in nodes.indices {
+            for second in (first + 1)..<nodes.count {
+                if let lhs = vectors[first], let rhs = vectors[second] {
+                    let score = Retrieval.similarity(lhs, rhs)
+                    if score >= 0.55 {
+                        similar[first].append((second, score))
+                        similar[second].append((first, score))
+                    }
+                }
+                let common = evidence[first].intersection(evidence[second]).count
+                if common > 0 {
+                    let weight = Double(common) / Double(evidence[first].count + evidence[second].count - common)
+                    shared[first].append((second, weight))
+                    shared[second].append((first, weight))
+                }
+            }
+        }
+
+        var edges: [String: MemoryGraphEdge] = [:]
+        func addNearest(_ neighbors: [Neighbor], from source: String, kind: (Double) -> MemoryGraphEdge.Kind) {
+            let ranked = neighbors.sorted {
+                if $0.weight != $1.weight { return $0.weight > $1.weight }
+                return nodes[$0.index].id < nodes[$1.index].id
+            }
+            // Each node nominates three neighbors. Either endpoint may nominate an undirected edge.
+            for neighbor in ranked.prefix(3) {
+                let edge = MemoryGraphEdge(source, nodes[neighbor.index].id, kind: kind(neighbor.weight),
+                                           weight: neighbor.weight)
+                edges[edge.id] = edge
+            }
+        }
+        for (index, node) in nodes.enumerated() {
+            addNearest(similar[index], from: node.id) { $0 >= 0.85 ? .duplicate : .semantic }
+            addNearest(shared[index], from: node.id) { _ in .sharedEvidence }
+        }
+        return edges.values.sorted { $0.id < $1.id }
     }
 
     private func calculateDuplicatePairs(_ candidates: [(id: String, vector: [Float])],
