@@ -105,13 +105,13 @@ struct MemoryListView: View {
             }
 
             if displayMode == .galaxy {
-                MemoryGalaxyView(model: model, onSelectMemoryID: onInspectMemoryID)
+                MemoryGalaxyView(model: model, mode: .interactiveFull, onSelectMemoryID: onInspectMemoryID)
             } else {
                 listContent
             }
         }
         .padding(20)
-        .background(theme.canvasBackground)
+        .background(Color.clear)
         .onAppear {
             if model.projectFilter && !model.project.isEmpty {
                 searchState.scopeMode = .projectAndGlobal

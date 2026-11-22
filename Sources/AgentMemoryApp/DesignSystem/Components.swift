@@ -506,3 +506,103 @@ struct PrimaryActionButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
+
+// MARK: - Wave 4 Liquid Glass Surfaces
+
+struct LiquidGlassSurfaceModifier: ViewModifier {
+    @Environment(\.theme) private var theme
+    let cornerRadius: CGFloat
+    let highlighted: Bool
+    let isPanel: Bool
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background {
+                ZStack {
+                    shape.fill(isPanel ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(.ultraThinMaterial))
+                    shape.fill(isPanel ? theme.glassPanelTint : theme.glassTint)
+                    if highlighted {
+                        shape.fill(
+                            LinearGradient(
+                                colors: [
+                                    theme.accent.opacity(theme.isDark ? 0.10 : 0.06),
+                                    Color.clear
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                    }
+                }
+            }
+            .overlay {
+                shape.strokeBorder(
+                    LinearGradient(
+                        stops: [
+                            .init(
+                                color: highlighted
+                                    ? (theme.isDark ? Color.white.opacity(0.42) : Color.white.opacity(0.98))
+                                    : theme.glassSpecularTop,
+                                location: 0.0
+                            ),
+                            .init(color: highlighted ? theme.accentBorder : theme.glassSpecularMid, location: 0.35),
+                            .init(color: theme.glassSpecularBottom, location: 1.0)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: highlighted ? 1.25 : 1.0
+                )
+            }
+            .shadow(
+                color: theme.glassShadow,
+                radius: highlighted ? 20 : (isPanel ? 18 : 12),
+                y: highlighted ? 10 : 6
+            )
+    }
+}
+
+struct LiquidGlassCapsuleModifier: ViewModifier {
+    @Environment(\.theme) private var theme
+    let highlighted: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                ZStack {
+                    Capsule().fill(.ultraThinMaterial)
+                    Capsule().fill(theme.glassTint)
+                }
+            }
+            .overlay {
+                Capsule().strokeBorder(
+                    LinearGradient(
+                        colors: [
+                            highlighted ? (theme.isDark ? Color.white.opacity(0.42) : Color.white) : theme.glassSpecularTop,
+                            highlighted ? theme.accentBorder : theme.glassSpecularMid,
+                            theme.glassSpecularBottom
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: highlighted ? 1.2 : 1.0
+                )
+            }
+            .shadow(color: theme.glassShadow, radius: highlighted ? 16 : 10, y: highlighted ? 7 : 4)
+    }
+}
+
+extension View {
+    func liquidGlassSurface(
+        cornerRadius: CGFloat = 18,
+        highlighted: Bool = false,
+        panel: Bool = false
+    ) -> some View {
+        modifier(LiquidGlassSurfaceModifier(cornerRadius: cornerRadius, highlighted: highlighted, isPanel: panel))
+    }
+
+    func liquidGlassCapsule(highlighted: Bool = false) -> some View {
+        modifier(LiquidGlassCapsuleModifier(highlighted: highlighted))
+    }
+}

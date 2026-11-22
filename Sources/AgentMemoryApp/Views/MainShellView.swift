@@ -13,6 +13,30 @@ private final class ShellState: ObservableObject {
     @Published var backfillDate = Calendar.current.startOfDay(for: Date())
     @Published var inspectorPresented = false
     @Published var pendingInspectMemoryID: String?
+    @Published var sidebarExpanded = false
+    @Published var dreamResonanceTrigger: Date? = nil
+
+    private var sidebarCollapseTask: Task<Void, Never>?
+
+    func setSidebarHovered(_ hovering: Bool) {
+        sidebarCollapseTask?.cancel()
+        if hovering {
+            if !sidebarExpanded {
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                    sidebarExpanded = true
+                }
+            }
+        } else {
+            sidebarCollapseTask = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(100)) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                    self?.sidebarExpanded = false
+                }
+            }
+        }
+    }
 }
 
 struct MainShellView: View {
@@ -21,47 +45,67 @@ struct MainShellView: View {
     @StateObject private var state = ShellState()
     @FocusState private var searchFocused: Bool
 
+    private var isFullScreenGalaxy: Bool {
+        state.selection == .memory && state.memoryDisplayMode == .galaxy
+    }
+
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 185, ideal: 210, max: 250)
-        } detail: {
-            ZStack(alignment: .top) {
-                VStack(spacing: 0) {
-                    if let error = model.error {
-                        ErrorBanner(message: error) {
-                            model.error = nil
-                        }
+        ZStack(alignment: .leading) {
+            // Layer 0: Borderless Full-Window 3D Elastic Memory Galaxy
+            MemoryGalaxyView(
+                model: model,
+                mode: isFullScreenGalaxy ? .interactiveFull : .ambientBackdrop,
+                dreamResonanceTrigger: state.dreamResonanceTrigger,
+                onSelectMemoryID: { memoryID in
+                    inspectMemory(id: memoryID)
+                }
+            )
+            .ignoresSafeArea()
+
+            // Layer 1: Top 62pt Native Window Drag & Double-Click Zoom Region
+            WindowDragRegion()
+                .frame(maxWidth: .infinity)
+                .frame(height: 62)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .ignoresSafeArea(edges: .top)
+
+            // Layer 2: Spatial Content Area (cleared past the 54pt collapsed rail)
+            VStack(spacing: 0) {
+                if let error = model.error {
+                    ErrorBanner(message: error) {
+                        model.error = nil
                     }
-                    pageContent
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
                 }
 
-                topToolbarFadeOverlay
+                contentLayer
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .padding(.leading, 68)
 
-                WindowDragRegion()
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 62)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .ignoresSafeArea(edges: .top)
-            }
-            .frame(minWidth: 480)
-            .background(theme.canvasBackground, ignoresSafeAreaEdges: .all)
-            .navigationTitle(state.selection.rawValue)
-            .toolbarBackground(.hidden, for: .windowToolbar)
-            .inspector(isPresented: $state.inspectorPresented) {
-                InspectorView(
-                    model: model,
-                    selection: state.selection,
-                    pickedDecision: $state.pickedDecision
-                )
-                .inspectorColumnWidth(min: 280, ideal: 340, max: 460)
-            }
-            .toolbar {
-                toolbarContent
-            }
+            // Layer 3: Leftmost Floating Hover-Expand Liquid Glass Navigation Rail
+            floatingLiquidGlassRail
+                .padding(.leading, 12)
+                .padding(.top, 10)
+                .padding(.bottom, 16)
+                .zIndex(20)
         }
-        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 860, minHeight: 540)
+        .navigationTitle(state.selection.rawValue)
+        .toolbarBackground(.hidden, for: .windowToolbar)
+        .inspector(isPresented: $state.inspectorPresented) {
+            InspectorView(
+                model: model,
+                selection: state.selection,
+                pickedDecision: $state.pickedDecision
+            )
+            .inspectorColumnWidth(min: 280, ideal: 340, max: 460)
+        }
+        .toolbar {
+            toolbarContent
+        }
         .background {
             Button("") { focusMemorySearch() }
                 .keyboardShortcut("f", modifiers: .command)
@@ -88,7 +132,11 @@ struct MainShellView: View {
                 state.inspectorPresented = false
             }
             if selection == .memory {
-                model.find()
+                if state.memoryDisplayMode == .galaxy {
+                    model.refreshMemoryGraph()
+                } else {
+                    model.find()
+                }
             }
         }
         .onChange(of: state.showBackfill) { _, isShown in
@@ -146,109 +194,73 @@ struct MainShellView: View {
         }
     }
 
-    // MARK: - Top Toolbar Fade Overlay
-
-    private var topToolbarFadeOverlay: some View {
-        ZStack {
-            Rectangle()
-                .fill(.ultraThinMaterial)
-            LinearGradient(
-                stops: [
-                    .init(color: theme.canvasBackground.opacity(0.96), location: 0.0),
-                    .init(color: theme.canvasBackground.opacity(0.96), location: 0.65),
-                    .init(color: theme.canvasBackground.opacity(0.50), location: 0.84),
-                    .init(color: theme.canvasBackground.opacity(0.0), location: 1.0)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-        .mask(
-            LinearGradient(
-                stops: [
-                    .init(color: .black, location: 0.0),
-                    .init(color: .black, location: 0.65),
-                    .init(color: .black.opacity(0.45), location: 0.84),
-                    .init(color: .clear, location: 1.0)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
-        .frame(height: 76)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
-    }
-
-    // MARK: - Sidebar
-
-    private var sidebar: some View {
-        List(AppPage.allCases, selection: $state.selection) { page in
-            let badge = page.badgeCount(in: model)
-            Label(page.rawValue, systemImage: page.icon)
-                .tag(page)
-                .badge(badge > 0 ? badge : 0)
-                .padding(.vertical, 3)
-        }
-        .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 0) {
-                Divider().overlay(theme.hairlineBorder)
-                sidebarStatusFooter
-                    .padding(12)
-            }
-        }
-    }
-
-    private var sidebarStatusFooter: some View {
-        let runtime = model.overallRuntimeStatus
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(runtime.kind.color(in: theme))
-                    .frame(width: 7, height: 7)
-                Text(runtime.title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-                Spacer()
-                if runtime.spinning {
-                    ProgressView().controlSize(.mini)
-                }
-            }
-
-            HStack(spacing: 6) {
-                AgentTag(agent: .codex, active: model.enabled)
-                AgentTag(agent: .antigravity, active: model.antigravityEnabled)
-            }
-            .scaleEffect(0.92, anchor: .leading)
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(theme.hairlineBorder, lineWidth: 1)
-        )
-    }
-
-    // MARK: - Page Content
+    // MARK: - Content Layer
 
     @ViewBuilder
-    private var pageContent: some View {
+    private var contentLayer: some View {
         switch state.selection {
         case .overview:
             OverviewView(
                 model: model,
                 selection: $state.selection,
+                isSidebarExpanded: state.sidebarExpanded,
                 onSearchMemory: { query in searchFromOverview(query) },
                 onInspectMemoryID: { memoryID in inspectMemory(id: memoryID) },
                 onOpenAgentSettings: { agent in openAgentSettings(agent) },
                 onInspectDormantMemories: { inspectDormantMemories() },
                 onOpenGalaxy: { openMemoryGalaxy() },
+                onTriggerDreamResonance: { state.dreamResonanceTrigger = Date() },
                 onNonDetailAction: { state.inspectorPresented = false }
             )
+
+        case .memory where state.memoryDisplayMode == .galaxy:
+            // Full-screen 3D galaxy lives in Layer 0; float only a compact mode switcher pill here
+            VStack {
+                HStack {
+                    Spacer()
+                    SegmentedPillBar(
+                        options: MemoryDisplayMode.allCases,
+                        selection: $state.memoryDisplayMode,
+                        label: { $0.rawValue },
+                        icon: { $0.icon },
+                        compact: true
+                    )
+                    .liquidGlassCapsule()
+                }
+                .padding(.top, 4)
+                .padding(.trailing, 18)
+                Spacer()
+            }
+
+        default:
+            // Translucent Liquid Glass Main Panel for Memory List / Dream / Activity / Settings
+            glassPageContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .liquidGlassSurface(cornerRadius: 20, panel: true)
+                .padding(.leading, 10)
+                .padding(.trailing, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 16)
+                .rotation3DEffect(
+                    .degrees(state.sidebarExpanded ? -12 : 0),
+                    axis: (x: 0, y: 1, z: 0),
+                    anchor: .trailing,
+                    perspective: 0.45
+                )
+                .offset(x: state.sidebarExpanded ? 72 : 0)
+                .scaleEffect(state.sidebarExpanded ? 0.93 : 1.0, anchor: .trailing)
+                .opacity(state.sidebarExpanded ? 0.64 : 1.0)
+                .blur(radius: state.sidebarExpanded ? 0.8 : 0)
+                .animation(.spring(response: 0.36, dampingFraction: 0.78), value: state.sidebarExpanded)
+        }
+    }
+
+    @ViewBuilder
+    private var glassPageContent: some View {
+        switch state.selection {
+        case .overview:
+            EmptyView()
         case .memory:
             MemoryListView(
                 model: model,
@@ -283,6 +295,140 @@ struct MainShellView: View {
                 showBackfill: $state.showBackfill,
                 selectedAgent: $state.setupAgent
             )
+        }
+    }
+
+    // MARK: - Hover-Expand Liquid Glass Navigation Rail
+
+    private var floatingLiquidGlassRail: some View {
+        let expanded = state.sidebarExpanded
+        let runtime = model.overallRuntimeStatus
+
+        return VStack(alignment: .leading, spacing: 6) {
+            ForEach(AppPage.allCases) { page in
+                let isSelected = state.selection == page
+                let badge = page.badgeCount(in: model)
+                Button {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.80)) {
+                        state.selection = page
+                    }
+                } label: {
+                    HStack(spacing: 11) {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: page.icon)
+                                .font(.system(size: 15, weight: isSelected ? .semibold : .medium))
+                                .foregroundStyle(isSelected ? theme.accent : theme.textSecondary)
+                                .frame(width: 24, height: 24)
+
+                            if !expanded && badge > 0 {
+                                Circle()
+                                    .fill(theme.warning)
+                                    .frame(width: 6.5, height: 6.5)
+                                    .shadow(color: theme.warning.opacity(0.75), radius: 3)
+                                    .offset(x: 2, y: -1)
+                            }
+                        }
+
+                        if expanded {
+                            Text(page.rawValue)
+                                .font(.callout.weight(isSelected ? .semibold : .medium))
+                                .foregroundStyle(isSelected ? theme.textPrimary : theme.textSecondary)
+                                .lineLimit(1)
+                                .transition(.opacity.combined(with: .move(edge: .leading)))
+
+                            Spacer(minLength: 4)
+
+                            if badge > 0 {
+                                Text("\(badge)")
+                                    .font(.caption2.weight(.semibold))
+                                    .monospacedDigit()
+                                    .foregroundStyle(theme.warning)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(theme.warningSoft, in: Capsule())
+                                    .transition(.opacity)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, expanded ? 11 : 7)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: expanded ? .leading : .center)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(isSelected ? theme.accentSoft : Color.clear)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(isSelected ? theme.accent.opacity(theme.isDark ? 0.36 : 0.28) : Color.clear, lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help(page.rawValue)
+            }
+
+            Spacer(minLength: 8)
+
+            Divider()
+                .overlay(theme.hairlineBorder)
+                .padding(.horizontal, 6)
+
+            // Bottom runtime status dot / expanded status footer
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    if runtime.spinning {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .scaleEffect(0.75)
+                            .frame(width: 14, height: 14)
+                    } else {
+                        Circle()
+                            .fill(runtime.kind.color(in: theme))
+                            .frame(width: 8, height: 8)
+                            .shadow(color: runtime.kind.color(in: theme).opacity(0.7), radius: 4)
+                            .frame(width: 14, height: 14)
+                    }
+
+                    if expanded {
+                        Text(runtime.title)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(theme.textPrimary)
+                            .lineLimit(1)
+                            .transition(.opacity)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: expanded ? .leading : .center)
+
+                if expanded {
+                    HStack(spacing: 8) {
+                        railAgentIndicator(.codex, active: model.enabled)
+                        railAgentIndicator(.antigravity, active: model.antigravityEnabled)
+                    }
+                    .transition(.opacity)
+                }
+            }
+            .padding(.horizontal, expanded ? 10 : 6)
+            .padding(.vertical, 6)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .frame(width: expanded ? 176 : 54)
+        .frame(maxHeight: .infinity)
+        .liquidGlassSurface(cornerRadius: 20, highlighted: expanded)
+        .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .onHover { hovering in
+            state.setSidebarHovered(hovering)
+        }
+    }
+
+    private func railAgentIndicator(_ brand: AgentBrand, active: Bool) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(active ? brand.color(in: theme) : theme.textTertiary.opacity(0.45))
+                .frame(width: 5.5, height: 5.5)
+            Text(brand.rawValue)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(active ? theme.textSecondary : theme.textTertiary)
+                .lineLimit(1)
         }
     }
 

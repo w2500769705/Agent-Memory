@@ -37,7 +37,7 @@ struct DreamView: View {
             }
             .padding(24)
         }
-        .background(theme.canvasBackground)
+        .background(Color.clear)
     }
 
     // MARK: - Header

@@ -93,6 +93,6 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
-        .background(theme.canvasBackground)
+        .background(Color.clear)
     }
 }

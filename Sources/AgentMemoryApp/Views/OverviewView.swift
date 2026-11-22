@@ -1,13 +1,12 @@
 import AgentMemoryCore
 import SwiftUI
 
-private struct RecentRecalledMemoryItem: Identifiable {
-    let id: String
-    let memoryID: String
-    let title: String
-    let excerpt: String
-    let agent: AgentBrand?
-    let timestamp: Date
+private enum OverviewStackCard: Int, CaseIterable, Identifiable {
+    case hub = 0
+    case agents = 1
+    case health = 2
+
+    var id: Int { rawValue }
 }
 
 private struct DuplicateComparisonItem: Identifiable {
@@ -20,37 +19,108 @@ private struct DuplicateComparisonItem: Identifiable {
 @MainActor
 private final class OverviewUIState: ObservableObject {
     @Published var searchDraft = ""
+    @Published var expandedCard: OverviewStackCard = .hub
     @Published var showAddAgentHint = false
     @Published var comparingDuplicate: DuplicateComparisonItem?
+    @Published var dreamCopiedConfirmation = false
+
+    var hoverSwitchTask: Task<Void, Never>?
+    var dreamConfirmationTask: Task<Void, Never>?
+
+    func scheduleFocus(_ card: OverviewStackCard) {
+        hoverSwitchTask?.cancel()
+        guard expandedCard != card else { return }
+        hoverSwitchTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(65)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.72)) {
+                self?.expandedCard = card
+            }
+        }
+    }
+
+    func focusImmediately(_ card: OverviewStackCard) {
+        hoverSwitchTask?.cancel()
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.72)) {
+            expandedCard = card
+        }
+    }
+
+    func triggerDreamConfirmation() {
+        dreamConfirmationTask?.cancel()
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.76)) {
+            dreamCopiedConfirmation = true
+        }
+        dreamConfirmationTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(2500)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                self?.dreamCopiedConfirmation = false
+            }
+        }
+    }
 }
 
 struct OverviewView: View {
     @Environment(\.theme) private var theme
     @ObservedObject var model: AppModel
     @Binding var selection: AppPage
+    let isSidebarExpanded: Bool
     let onSearchMemory: (String) -> Void
     let onInspectMemoryID: (String) -> Void
     let onOpenAgentSettings: (AgentBrand) -> Void
     let onInspectDormantMemories: () -> Void
     let onOpenGalaxy: () -> Void
+    let onTriggerDreamResonance: () -> Void
     let onNonDetailAction: () -> Void
 
     @StateObject private var ui = OverviewUIState()
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                headerRow
-                topQuickActionBar
-                connectedAgentsRow
-                todayRecallWideCard
-                kpiRow
-                memoryHealthSection
-                galaxyPreviewContainer
+        ZStack(alignment: .topLeading) {
+            // 1. Mid-Left Floating Liquid Glass Search + 3 Stacked Q-Bounce Cards
+            // Right-hand open space remains completely unobstructed & interactive for the 3D Galaxy behind.
+            leftFloatingStack
+                .frame(width: 314)
+                .padding(.leading, 18)
+                .padding(.top, 14)
+                .padding(.bottom, 22)
+                .rotation3DEffect(
+                    .degrees(isSidebarExpanded ? -12 : 0),
+                    axis: (x: 0, y: 1, z: 0),
+                    anchor: .trailing,
+                    perspective: 0.45
+                )
+                .offset(x: isSidebarExpanded ? 72 : 0)
+                .scaleEffect(isSidebarExpanded ? 0.93 : 1.0, anchor: .trailing)
+                .opacity(isSidebarExpanded ? 0.64 : 1.0)
+                .blur(radius: isSidebarExpanded ? 0.8 : 0)
+                .animation(.spring(response: 0.36, dampingFraction: 0.78), value: isSidebarExpanded)
+
+            // 2. Right-Hand Bottom-Centered Floating "批量做梦" Nebula Iridescent Main Capsule
+            VStack {
+                Spacer(minLength: 0)
+                HStack(spacing: 0) {
+                    Color.clear
+                        .frame(width: 332, height: 1)
+                        .allowsHitTesting(false)
+                    Spacer(minLength: 0)
+                    DreamResonanceCapsule(
+                        pendingCount: model.dashboard?.pending ?? 0,
+                        hasQueuedBatch: model.dashboard?.queuedThrough != nil,
+                        isCopiedConfirmation: ui.dreamCopiedConfirmation
+                    ) {
+                        handleBatchDreamTap()
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.bottom, 26)
+                .padding(.trailing, 18)
             }
-            .padding(24)
         }
-        .background(theme.canvasBackground)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .sheet(isPresented: $ui.showAddAgentHint) {
             addAgentPlaceholderSheet
         }
@@ -69,108 +139,74 @@ struct OverviewView: View {
         }
     }
 
-    // MARK: - Header
+    private func handleBatchDreamTap() {
+        onNonDetailAction()
+        if model.dashboard?.queuedThrough != nil {
+            model.copyBatchDream()
+        } else {
+            model.copyDreamInstructions()
+        }
+        ui.triggerDreamConfirmation()
+        onTriggerDreamResonance()
+    }
 
-    private var headerRow: some View {
-        let embedding = vectorCapsulePresentation
-        let runtime = model.overallRuntimeStatus
-        return HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("记忆中枢概览")
-                    .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                Text("跨 Agent 持久记忆、实时状态监控与语义检索")
-                    .font(.callout)
-                    .foregroundStyle(theme.textSecondary)
+    // MARK: - Mid-Left Floating Stack
+
+    private var leftFloatingStack: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            standaloneSearchBar
+
+            VStack(alignment: .leading, spacing: 10) {
+                memoryHubCard
+                connectedAgentsCard
+                memoryHealthCard
             }
-            Spacer()
-            HStack(spacing: 8) {
-                StatusCapsule(title: embedding.title, kind: embedding.kind, showSpinner: embedding.spinning)
-                    .help("\(model.runtimeHealth.embedding.presentation.detail) · \(model.smartCapture ? "省电模式（FSEvents 监听，空闲自动休眠）" : "定时轮询模式（30s）")")
-                StatusCapsule(title: runtime.title, kind: runtime.kind, showSpinner: runtime.spinning)
-                    .help(model.smartCapture ? "省电模式已开启：通过 macOS FSEvents 按需采集" : "当前为定时轮询采集模式")
-            }
+
+            Spacer(minLength: 0)
         }
     }
 
-    private var vectorCapsulePresentation: (title: String, kind: RuntimeStatusKind, spinning: Bool) {
-        switch model.runtimeHealth.embedding {
-        case .checking:
-            return ("向量检查中", .indexing, true)
-        case .indexing:
-            return ("向量索引中", .indexing, true)
-        case .ready:
-            return ("本地向量已就绪", .active, false)
-        case .unavailable:
-            return ("向量未就绪", .paused, false)
-        case .failed:
-            return ("向量异常", .error, false)
-        }
-    }
+    // MARK: - Pure Standalone Liquid Glass Search Box (No Dream CTA Inside)
 
-    // MARK: - Top High-Frequency Bar
+    private var standaloneSearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(theme.textSecondary)
 
-    private var topQuickActionBar: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(theme.textTertiary)
-                TextField("搜索记忆标题、正文或技术词，回车直达检索透视…", text: $ui.searchDraft)
-                    .textFieldStyle(.plain)
-                    .onSubmit {
-                        submitOverviewSearch()
-                    }
-                if !ui.searchDraft.isEmpty {
-                    Button {
-                        ui.searchDraft = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(theme.textTertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("清空搜索输入")
-                }
-                Button {
+            TextField("搜索长期记忆…", text: $ui.searchDraft)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .foregroundStyle(theme.textPrimary)
+                .onSubmit {
                     submitOverviewSearch()
+                }
+
+            if !ui.searchDraft.isEmpty {
+                Button {
+                    ui.searchDraft = ""
                 } label: {
-                    Text("检索")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(theme.accent)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(theme.accentSoft, in: Capsule())
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(theme.textTertiary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("清空搜索输入")
+            } else {
+                Text("⌘F")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(theme.textTertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(theme.surfaceSecondary.opacity(theme.isDark ? 0.55 : 0.72), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .stroke(theme.hairlineBorder, lineWidth: 0.8)
+                    )
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(theme.surfacePrimary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(theme.hairlineBorder, lineWidth: 1)
-            )
-            .shadow(color: theme.cardShadow, radius: 3, y: 1)
-
-            Button {
-                model.copyBatchDream()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "moon.stars.fill")
-                    Text("复制批量做梦指令")
-                    if let pending = model.dashboard?.pending, pending > 0 {
-                        Text("\(pending)")
-                            .font(.caption2.weight(.semibold))
-                            .monospacedDigit()
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.black.opacity(0.16), in: Capsule())
-                    }
-                }
-            }
-            .buttonStyle(PrimaryActionButtonStyle())
-            .disabled(model.dashboard?.queuedThrough == nil)
-            .help(model.dashboard?.queuedThrough == nil ? "当前暂无待做梦记录" : "复制批量做梦指令到剪贴板，粘贴到 Agent 中处理待做梦记录")
         }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .liquidGlassSurface(cornerRadius: 14)
     }
 
     private func submitOverviewSearch() {
@@ -179,111 +215,304 @@ struct OverviewView: View {
         ui.searchDraft = ""
     }
 
-    // MARK: - Row 1: Connected Agents (Extensible Equal-Height Grid + Add Card)
+    // MARK: - Card 1 (Default Expanded): Memory Hub
 
-    private var connectedAgentsRow: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("已接入 Agent", count: 2)
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 250), spacing: 12)],
-                alignment: .leading,
-                spacing: 12
-            ) {
-                agentHealthCard(
-                    brand: .codex,
-                    connected: model.connection?.toolsAvailable == true,
-                    captureEnabled: model.enabled,
-                    captureState: model.runtimeHealth.codexCapture,
-                    recallActive: model.recallEnabled && model.connection?.recallInstalled == true,
-                    lastScan: model.runtimeHealth.codexLastScan,
-                    isScanning: model.scanning,
-                    onScan: { Task { await model.scan(force: true) } },
-                    onOpenSettings: { onOpenAgentSettings(.codex) }
-                )
-                agentHealthCard(
-                    brand: .antigravity,
-                    connected: model.antigravityConnection?.toolsAvailable == true,
-                    captureEnabled: model.antigravityEnabled,
-                    captureState: model.runtimeHealth.antigravityCapture,
-                    recallActive: model.antigravityRecallEnabled && model.antigravityConnection?.recallInstalled == true,
-                    lastScan: model.runtimeHealth.antigravityLastScan,
-                    isScanning: model.antigravityScanning,
-                    onScan: { Task { await model.scanAntigravity(force: true) } },
-                    onOpenSettings: { onOpenAgentSettings(.antigravity) }
-                )
-                AddAgentPlaceholderCard {
-                    onNonDetailAction()
-                    ui.showAddAgentHint = true
+    private var memoryHubCard: some View {
+        let isExpanded = ui.expandedCard == .hub
+        let activeCount = model.dashboard?.memories ?? model.healthSummary.activeCount
+        let pendingCount = model.dashboard?.pending ?? 0
+        let reviewCount = model.dashboard?.review ?? 0
+        let clusterCount = MemoryGalaxyView.clusterCount(for: model.memoryGraph)
+        let runtime = model.overallRuntimeStatus
+
+        return VStack(alignment: .leading, spacing: isExpanded ? 12 : 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles.rectangle.stack")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.accent)
+                    .frame(width: 24, height: 24)
+                    .background(theme.accentSoft, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                Text("记忆中枢")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(theme.textPrimary)
+
+                Spacer(minLength: 4)
+
+                if isExpanded {
+                    StatusCapsule(title: runtime.title, kind: runtime.kind, showSpinner: runtime.spinning)
+                        .scaleEffect(0.88, anchor: .trailing)
+                } else {
+                    HStack(spacing: 6) {
+                        Text("活跃 \(activeCount)")
+                            .foregroundStyle(theme.textPrimary)
+                        Text("·")
+                            .foregroundStyle(theme.textTertiary)
+                        Text("待审 \(pendingCount + reviewCount)")
+                            .foregroundStyle((pendingCount + reviewCount) > 0 ? theme.warning : theme.textSecondary)
+                    }
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
                 }
             }
+
+            if isExpanded {
+                HStack(spacing: 8) {
+                    hubStatTile(title: "今日召回", value: "\(model.todayRecallCount)", tint: theme.accent) {
+                        selection = .activity
+                    }
+                    hubStatTile(title: "估算 Token", value: "~\(model.todayRecallEstimatedTokens.formatted(.number))", tint: theme.info) {
+                        selection = .activity
+                    }
+                    hubStatTile(title: "语义星系", value: "\(clusterCount)", tint: theme.scopeGlobal) {
+                        onOpenGalaxy()
+                    }
+                }
+
+                Divider().overlay(theme.hairlineBorder)
+
+                HStack(spacing: 8) {
+                    hubQuickPill(label: "活跃记忆", count: activeCount, tint: theme.accent) {
+                        selection = .memory
+                    }
+                    hubQuickPill(label: "待做梦", count: pendingCount, tint: theme.info) {
+                        selection = .dream
+                    }
+                    hubQuickPill(label: "待确认", count: reviewCount, tint: reviewCount > 0 ? theme.warning : theme.success) {
+                        selection = .dream
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(model.runtimeHealth.embedding.presentation.kind.color(in: theme))
+                        .frame(width: 6, height: 6)
+                    Text(model.runtimeHealth.embedding.presentation.detail)
+                        .font(.caption2)
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button {
+                        onOpenGalaxy()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text("全屏星图")
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(isExpanded ? 14 : 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .liquidGlassSurface(cornerRadius: 16, highlighted: isExpanded)
+        .scaleEffect(isExpanded ? 1.018 : 0.985)
+        .opacity(isExpanded ? 1.0 : 0.84)
+        .zIndex(isExpanded ? 3 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onHover { hovering in
+            if hovering { ui.scheduleFocus(.hub) }
+        }
+        .onTapGesture {
+            if !isExpanded { ui.focusImmediately(.hub) }
         }
     }
 
-    private func agentHealthCard(
+    private func hubStatTile(title: String, value: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(value)
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(tint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                Text(title)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.textSecondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 8)
+            .background(theme.surfaceSecondary.opacity(theme.isDark ? 0.52 : 0.70), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(theme.hairlineBorder, lineWidth: 0.9)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func hubQuickPill(label: String, count: Int, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(theme.textSecondary)
+                Text("\(count)")
+                    .font(.caption2.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(tint)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 5)
+            .background(tint.opacity(theme.isDark ? 0.12 : 0.08), in: Capsule())
+            .overlay(Capsule().stroke(tint.opacity(0.24), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Card 2: Connected Agents
+
+    private var connectedAgentsCard: some View {
+        let isExpanded = ui.expandedCard == .agents
+        let codexOnline = model.connection?.toolsAvailable == true || model.enabled
+        let agyOnline = model.antigravityConnection?.toolsAvailable == true || model.antigravityEnabled
+
+        return VStack(alignment: .leading, spacing: isExpanded ? 10 : 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.agentAntigravity)
+                    .frame(width: 24, height: 24)
+                    .background(theme.agentAntigravitySoft, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                Text("已接入 Agent")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(theme.textPrimary)
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 8) {
+                    agentStatusDot(brand: .codex, active: codexOnline)
+                    agentStatusDot(brand: .antigravity, active: agyOnline)
+                }
+            }
+
+            if isExpanded {
+                VStack(spacing: 8) {
+                    compactAgentRow(
+                        brand: .codex,
+                        connected: model.connection?.toolsAvailable == true,
+                        captureEnabled: model.enabled,
+                        captureState: model.runtimeHealth.codexCapture,
+                        recallActive: model.recallEnabled && model.connection?.recallInstalled == true,
+                        isScanning: model.scanning,
+                        onScan: { Task { await model.scan(force: true) } },
+                        onOpenSettings: { onOpenAgentSettings(.codex) }
+                    )
+
+                    compactAgentRow(
+                        brand: .antigravity,
+                        connected: model.antigravityConnection?.toolsAvailable == true,
+                        captureEnabled: model.antigravityEnabled,
+                        captureState: model.runtimeHealth.antigravityCapture,
+                        recallActive: model.antigravityRecallEnabled && model.antigravityConnection?.recallInstalled == true,
+                        isScanning: model.antigravityScanning,
+                        onScan: { Task { await model.scanAntigravity(force: true) } },
+                        onOpenSettings: { onOpenAgentSettings(.antigravity) }
+                    )
+
+                    Button {
+                        onNonDetailAction()
+                        ui.showAddAgentHint = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("接入更多 Agent")
+                                .font(.caption.weight(.medium))
+                            Spacer()
+                            Text("Claude Code · Cursor")
+                                .font(.caption2)
+                                .foregroundStyle(theme.textTertiary)
+                        }
+                        .foregroundStyle(theme.textSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            theme.surfaceSecondary.opacity(theme.isDark ? 0.35 : 0.50),
+                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(theme.strongBorder, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("查看已支持的 Agent 与后续扩展计划")
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(isExpanded ? 14 : 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .liquidGlassSurface(cornerRadius: 16, highlighted: isExpanded)
+        .scaleEffect(isExpanded ? 1.018 : 0.985)
+        .opacity(isExpanded ? 1.0 : 0.84)
+        .zIndex(isExpanded ? 3 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onHover { hovering in
+            if hovering { ui.scheduleFocus(.agents) }
+        }
+        .onTapGesture {
+            if !isExpanded { ui.focusImmediately(.agents) }
+        }
+    }
+
+    private func agentStatusDot(brand: AgentBrand, active: Bool) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(active ? brand.color(in: theme) : theme.textTertiary.opacity(0.45))
+                .frame(width: 6.5, height: 6.5)
+                .shadow(color: active ? brand.color(in: theme).opacity(0.65) : .clear, radius: 3)
+            Text(brand.rawValue)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(active ? theme.textPrimary : theme.textTertiary)
+        }
+    }
+
+    private func compactAgentRow(
         brand: AgentBrand,
         connected: Bool,
         captureEnabled: Bool,
         captureState: RuntimeHealth.CaptureState,
         recallActive: Bool,
-        lastScan: Date?,
         isScanning: Bool,
         onScan: @escaping () -> Void,
         onOpenSettings: @escaping () -> Void
     ) -> some View {
-        let capture = captureState.presentation(smartCapture: model.smartCapture)
         let isCapturing = captureState == .idle || captureState == .scanning
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
                 AgentTag(agent: brand, active: connected || isCapturing)
-                Spacer()
-                StatusCapsule(title: capture.title, kind: capture.kind, showSpinner: capture.spinning)
-            }
-
-            HStack(spacing: 12) {
-                miniLight("MCP", ok: connected)
-                miniLight("采集", ok: isCapturing)
-                miniLight("自动注入", ok: recallActive)
-            }
-
-            Spacer(minLength: 4)
-
-            HStack(spacing: 8) {
-                HStack(spacing: 4) {
-                    Image(systemName: "clock")
-                        .font(.caption2)
-                    if let lastScan {
-                        Text(lastScan, format: .dateTime.hour().minute())
-                            .monospacedDigit()
-                    } else {
-                        Text(isCapturing ? "待首次扫描" : "未开启")
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(theme.textTertiary)
-                .lineLimit(1)
-
                 Spacer(minLength: 4)
-
                 Button(action: onScan) {
                     HStack(spacing: 4) {
                         if isScanning {
                             ProgressView()
                                 .controlSize(.mini)
-                                .scaleEffect(0.75)
+                                .scaleEffect(0.7)
                         } else {
                             Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 10, weight: .semibold))
+                                .font(.system(size: 9.5, weight: .semibold))
                         }
                         Text(isScanning ? "扫描中" : "立即扫描")
                             .font(.caption2.weight(.medium))
                     }
                     .foregroundStyle(captureEnabled && !isScanning ? theme.textPrimary : theme.textTertiary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3.5)
+                    .background(theme.surfacePrimary.opacity(theme.isDark ? 0.55 : 0.78), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(theme.hairlineBorder, lineWidth: 1)
+                            .stroke(theme.hairlineBorder, lineWidth: 0.9)
                     )
                 }
                 .buttonStyle(.plain)
@@ -292,34 +521,247 @@ struct OverviewView: View {
 
                 Button(action: onOpenSettings) {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(theme.textSecondary)
-                        .frame(width: 24, height: 24)
-                        .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .frame(width: 22, height: 22)
+                        .background(theme.surfacePrimary.opacity(theme.isDark ? 0.55 : 0.78), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .stroke(theme.hairlineBorder, lineWidth: 1)
+                                .stroke(theme.hairlineBorder, lineWidth: 0.9)
                         )
                 }
                 .buttonStyle(.plain)
                 .help("前往设置配置 \(brand.rawValue) 连接与自动检索")
                 .accessibilityLabel("\(brand.rawValue) 连接设置")
             }
+
+            HStack(spacing: 10) {
+                miniLight("MCP", ok: connected)
+                miniLight("采集", ok: isCapturing)
+                miniLight("自动注入", ok: recallActive)
+                Spacer(minLength: 0)
+            }
         }
-        .frame(maxWidth: .infinity, minHeight: 112, maxHeight: .infinity, alignment: .topLeading)
-        .surfaceCard(cornerRadius: 12, padding: 14)
+        .padding(9)
+        .background(theme.surfaceSecondary.opacity(theme.isDark ? 0.50 : 0.68), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(theme.hairlineBorder, lineWidth: 0.9)
+        )
     }
 
     private func miniLight(_ label: String, ok: Bool) -> some View {
         HStack(spacing: 4) {
             Circle()
                 .fill(ok ? theme.success : theme.textTertiary.opacity(0.45))
-                .frame(width: 6, height: 6)
+                .frame(width: 5.5, height: 5.5)
             Text(label)
-                .font(.caption2)
+                .font(.system(size: 10.5))
                 .foregroundStyle(ok ? theme.textPrimary : theme.textTertiary)
         }
     }
+
+    // MARK: - Card 3: Memory Health
+
+    private var memoryHealthCard: some View {
+        let isExpanded = ui.expandedCard == .health
+        let health = model.healthSummary
+        let total = max(health.activeCount + health.archivedCount, 0)
+        let activeRatio = total > 0 ? Double(health.activeCount) / Double(total) : 1.0
+        let activePercent = Int((activeRatio * 100).rounded())
+        let needsAttention = !health.dormantMemoryIDs.isEmpty || !health.duplicatePairs.isEmpty
+
+        return VStack(alignment: .leading, spacing: isExpanded ? 10 : 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "heart.text.square")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(needsAttention ? theme.warning : theme.success)
+                    .frame(width: 24, height: 24)
+                    .background(needsAttention ? theme.warningSoft : theme.successSoft, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                Text("记忆健康度")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(theme.textPrimary)
+
+                Spacer(minLength: 4)
+
+                if isExpanded {
+                    Button {
+                        model.refreshHealthSummary()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("刷新记忆健康体检")
+                } else {
+                    Text("活跃 \(activePercent)% · \(needsAttention ? "待整理" : "良好")")
+                        .font(.caption.weight(.medium))
+                        .monospacedDigit()
+                        .foregroundStyle(needsAttention ? theme.warning : theme.success)
+                }
+            }
+
+            if isExpanded {
+                // Active / Archived bar
+                VStack(alignment: .leading, spacing: 6) {
+                    GeometryReader { proxy in
+                        let width = max(proxy.size.width, 1)
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(theme.surfaceSecondary)
+                            Capsule()
+                                .fill(theme.accent)
+                                .frame(width: total > 0 ? max(width * activeRatio, health.activeCount > 0 ? 6 : 0) : 0)
+                        }
+                    }
+                    .frame(height: 7)
+
+                    HStack(spacing: 12) {
+                        HStack(spacing: 4) {
+                            Circle().fill(theme.accent).frame(width: 6, height: 6)
+                            Text("活跃 \(health.activeCount)")
+                                .font(.caption2.weight(.medium))
+                                .monospacedDigit()
+                                .foregroundStyle(theme.textPrimary)
+                        }
+                        HStack(spacing: 4) {
+                            Circle().fill(theme.textTertiary.opacity(0.45)).frame(width: 6, height: 6)
+                            Text("归档 \(health.archivedCount)")
+                                .font(.caption2.weight(.medium))
+                                .monospacedDigit()
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                        Spacer()
+                        Text("\(activePercent)%")
+                            .font(.caption2.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(theme.accent)
+                    }
+                }
+
+                // Dormant jump row
+                Button {
+                    if !health.dormantMemoryIDs.isEmpty {
+                        onInspectDormantMemories()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "moon.zzz")
+                            .font(.caption)
+                            .foregroundStyle(health.dormantMemoryIDs.isEmpty ? theme.success : theme.warning)
+                        Text("沉睡记忆")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(theme.textPrimary)
+                        Spacer()
+                        Text("\(health.dormantMemoryIDs.count) 条")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(health.dormantMemoryIDs.isEmpty ? theme.success : theme.warning)
+                        if !health.dormantMemoryIDs.isEmpty {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(theme.accent)
+                        }
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .background(theme.surfaceSecondary.opacity(theme.isDark ? 0.50 : 0.68), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(theme.hairlineBorder, lineWidth: 0.9)
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(health.dormantMemoryIDs.isEmpty)
+
+                // Suspected duplicates side-by-side entry
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("疑似重复", systemImage: "square.on.square")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(theme.textSecondary)
+                        Spacer()
+                        Text("\(health.duplicatePairs.count) 对")
+                            .font(.caption2.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(health.duplicatePairs.isEmpty ? theme.success : theme.warning)
+                    }
+
+                    if health.duplicatePairs.isEmpty {
+                        Text("活跃记忆语义分布良好，未发现高相似重复对。")
+                            .font(.caption2)
+                            .foregroundStyle(theme.textTertiary)
+                    } else {
+                        ForEach(Array(health.duplicatePairs.prefix(2).enumerated()), id: \.offset) { _, pair in
+                            let memA = resolveMemory(id: pair.memoryAID)
+                            let memB = resolveMemory(id: pair.memoryBID)
+                            Button {
+                                guard let memA, let memB else { return }
+                                onNonDetailAction()
+                                ui.comparingDuplicate = DuplicateComparisonItem(
+                                    id: "\(pair.memoryAID)-\(pair.memoryBID)",
+                                    memoryA: memA,
+                                    memoryB: memB,
+                                    similarity: pair.similarity
+                                )
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text("\(Int((pair.similarity * 100).rounded()))%")
+                                        .font(.caption2.weight(.semibold))
+                                        .monospacedDigit()
+                                        .foregroundStyle(theme.warning)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 2)
+                                        .background(theme.warningSoft, in: Capsule())
+                                    Text(memA?.title ?? String(pair.memoryAID.prefix(8)))
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(theme.textPrimary)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 4)
+                                    Text("对比")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(theme.accent)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(theme.surfaceSecondary.opacity(theme.isDark ? 0.50 : 0.68), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(theme.hairlineBorder, lineWidth: 0.9)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(memA == nil || memB == nil)
+                        }
+                    }
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(isExpanded ? 14 : 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .liquidGlassSurface(cornerRadius: 16, highlighted: isExpanded)
+        .scaleEffect(isExpanded ? 1.018 : 0.985)
+        .opacity(isExpanded ? 1.0 : 0.84)
+        .zIndex(isExpanded ? 3 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onHover { hovering in
+            if hovering { ui.scheduleFocus(.health) }
+        }
+        .onTapGesture {
+            if !isExpanded { ui.focusImmediately(.health) }
+        }
+    }
+
+    private func resolveMemory(id: String) -> Memory? {
+        if let hit = model.hits.first(where: { $0.id == id }) {
+            return hit.memory
+        }
+        return try? model.memory(id: id, version: nil)
+    }
+
+    // MARK: - Add Agent Placeholder Sheet
 
     private var addAgentPlaceholderSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -361,534 +803,156 @@ struct OverviewView: View {
         .frame(width: 400)
         .applyTheme(model.themeMode)
     }
-
-    // MARK: - Row 2: Today Recall Full-Width Card
-
-    private var recentRecalledMemories: [RecentRecalledMemoryItem] {
-        let recallEvents = model.recentActivities.filter { $0.kind == .recall && !$0.memoryIDs.isEmpty }
-        var seen = Set<String>()
-        var items: [RecentRecalledMemoryItem] = []
-
-        for event in recallEvents {
-            for memoryID in event.memoryIDs {
-                guard !seen.contains(memoryID) else { continue }
-                seen.insert(memoryID)
-
-                let resolvedMemory: Memory? = model.hits.first(where: { $0.id == memoryID })?.memory
-                    ?? (try? model.memory(id: memoryID))
-                let title = resolvedMemory?.title ?? "记忆 \(memoryID.prefix(10))"
-                let rawBody = resolvedMemory?.body ?? (event.message ?? "点击在右侧检查器查看完整记忆内容")
-                let singleLineExcerpt = rawBody
-                    .replacingOccurrences(of: "\n", with: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-
-                items.append(RecentRecalledMemoryItem(
-                    id: "\(event.id)-\(memoryID)",
-                    memoryID: memoryID,
-                    title: title,
-                    excerpt: singleLineExcerpt,
-                    agent: event.agent?.brand,
-                    timestamp: event.timestamp
-                ))
-                if items.count >= 3 { return items }
-            }
-        }
-        return items
-    }
-
-    private var todayRecallWideCard: some View {
-        let recalledItems = recentRecalledMemories
-        return HStack(alignment: .top, spacing: 18) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    Label("今日自动注入", systemImage: "bolt.horizontal.circle.fill")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    Text(model.recallCrossProject ? "跨项目" : "当前项目+全局")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(theme.accent)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2.5)
-                        .background(theme.accentSoft, in: Capsule())
-                }
-
-                HStack(alignment: .firstTextBaseline, spacing: 24) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(model.todayRecallCount, format: .number)
-                            .font(.system(size: 26, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(theme.textPrimary)
-                        Text("注入次数")
-                            .font(.caption2)
-                            .foregroundStyle(theme.textTertiary)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("~\(model.todayRecallEstimatedTokens.formatted(.number))")
-                            .font(.system(size: 26, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(theme.accent)
-                        Text("估算 Token")
-                            .font(.caption2)
-                            .foregroundStyle(theme.textTertiary)
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                HStack(spacing: 8) {
-                    Text("已启用同会话去重与短句过滤")
-                        .font(.caption2)
-                        .foregroundStyle(theme.textTertiary)
-                        .lineLimit(1)
-                    Spacer()
-                    Button {
-                        selection = .activity
-                    } label: {
-                        HStack(spacing: 3) {
-                            Text("查看活动")
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(theme.accent)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .frame(width: 248, alignment: .topLeading)
-
-            Rectangle()
-                .fill(theme.hairlineBorder)
-                .frame(width: 1)
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("最近自动注入的记忆摘要")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(theme.textSecondary)
-                    Spacer()
-                    if let latest = recalledItems.first {
-                        HStack(spacing: 4) {
-                            Text("最近一次")
-                            Text(latest.timestamp, format: .dateTime.hour().minute())
-                                .monospacedDigit()
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(theme.textTertiary)
-                    }
-                }
-
-                if recalledItems.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("最近暂无自动注入命中记录")
-                            .font(.callout.weight(.medium))
-                            .foregroundStyle(theme.textSecondary)
-                        Text("开启自动检索后，Codex 或 Antigravity 在对话前自动注入的关键记忆摘要会实时显示在此，点击可直达详情检查器。")
-                            .font(.caption)
-                            .foregroundStyle(theme.textTertiary)
-                            .lineLimit(2)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                    .padding(.vertical, 6)
-                } else {
-                    VStack(spacing: 6) {
-                        ForEach(recalledItems) { item in
-                            Button {
-                                onInspectMemoryID(item.memoryID)
-                            } label: {
-                                HStack(alignment: .center, spacing: 10) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        HStack(spacing: 6) {
-                                            Text(item.title)
-                                                .font(.caption.weight(.semibold))
-                                                .foregroundStyle(theme.textPrimary)
-                                                .lineLimit(1)
-                                            if let agent = item.agent {
-                                                Text(agent.rawValue)
-                                                    .font(.system(size: 10, weight: .medium))
-                                                    .foregroundStyle(agent.color(in: theme))
-                                                    .padding(.horizontal, 5)
-                                                    .padding(.vertical, 1)
-                                                    .background(agent.softColor(in: theme), in: Capsule())
-                                            }
-                                        }
-                                        Text(item.excerpt)
-                                            .font(.caption2)
-                                            .foregroundStyle(theme.textSecondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer(minLength: 6)
-                                    Text(item.timestamp, format: .dateTime.hour().minute())
-                                        .font(.caption2)
-                                        .monospacedDigit()
-                                        .foregroundStyle(theme.textTertiary)
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundStyle(theme.textTertiary)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 7)
-                                .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .stroke(theme.hairlineBorder, lineWidth: 1)
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .help("点击在右侧检查器查看「\(item.title)」")
-                        }
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
-        .fixedSize(horizontal: false, vertical: true)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .surfaceCard(cornerRadius: 13, padding: 15)
-    }
-
-    // MARK: - Row 3: KPI Cards (3-Column Equal Height)
-
-    private var kpiRow: some View {
-        HStack(alignment: .top, spacing: 12) {
-            KPIMetricCard(
-                title: "正式记忆",
-                value: "\(model.dashboard?.memories ?? 0)",
-                subtitle: "已沉淀且可检索的长期记忆",
-                icon: "brain.head.profile",
-                tint: theme.accent
-            ) {
-                selection = .memory
-            }
-            KPIMetricCard(
-                title: "待做梦",
-                value: "\(model.dashboard?.pending ?? 0)",
-                subtitle: "等待归纳提炼的新对话证据",
-                icon: "moon.stars",
-                tint: theme.info
-            ) {
-                selection = .dream
-            }
-            KPIMetricCard(
-                title: "待确认",
-                value: "\(model.dashboard?.review ?? 0)",
-                subtitle: "存在冲突或需人工审阅的提案",
-                icon: "checkmark.shield",
-                tint: (model.dashboard?.review ?? 0) > 0 ? theme.warning : theme.success
-            ) {
-                selection = .dream
-            }
-        }
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    // MARK: - Row 4: Memory Health Summary
-
-    private var memoryHealthSection: some View {
-        let health = model.healthSummary
-        let total = max(health.activeCount + health.archivedCount, 0)
-        let activeRatio = total > 0 ? Double(health.activeCount) / Double(total) : 1.0
-
-        return VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("记忆健康度") {
-                Button {
-                    model.refreshHealthSummary()
-                } label: {
-                    Label("刷新体检", systemImage: "arrow.clockwise")
-                        .font(.caption)
-                        .foregroundStyle(theme.textSecondary)
-                }
-                .buttonStyle(.plain)
-            }
-
-            HStack(alignment: .top, spacing: 12) {
-                // 1. Active vs Archived Distribution
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label("活跃 / 归档分布", systemImage: "chart.bar.xaxis")
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(theme.textPrimary)
-                        Spacer()
-                        Text("总计 \(total)")
-                            .font(.caption2.weight(.medium))
-                            .monospacedDigit()
-                            .foregroundStyle(theme.textTertiary)
-                    }
-
-                    GeometryReader { proxy in
-                        let width = max(proxy.size.width, 1)
-                        ZStack(alignment: .leading) {
-                            Capsule()
-                                .fill(theme.surfaceSecondary)
-                            Capsule()
-                                .fill(theme.accent)
-                                .frame(width: total > 0 ? max(width * activeRatio, health.activeCount > 0 ? 6 : 0) : 0)
-                        }
-                    }
-                    .frame(height: 8)
-
-                    HStack(spacing: 14) {
-                        HStack(spacing: 5) {
-                            Circle().fill(theme.accent).frame(width: 7, height: 7)
-                            Text("活跃 \(health.activeCount)")
-                                .font(.caption.weight(.medium))
-                                .monospacedDigit()
-                                .foregroundStyle(theme.textPrimary)
-                        }
-                        HStack(spacing: 5) {
-                            Circle().fill(theme.textTertiary.opacity(0.45)).frame(width: 7, height: 7)
-                            Text("归档 \(health.archivedCount)")
-                                .font(.caption.weight(.medium))
-                                .monospacedDigit()
-                                .foregroundStyle(theme.textSecondary)
-                        }
-                        Spacer()
-                    }
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .surfaceCard(cornerRadius: 12, padding: 13)
-
-                // 2. Dormant Memories (>30 days untouched & 0 hits)
-                Button {
-                    if !health.dormantMemoryIDs.isEmpty {
-                        onInspectDormantMemories()
-                    }
-                } label: {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("沉睡记忆", systemImage: "moon.zzz")
-                                .font(.callout.weight(.semibold))
-                                .foregroundStyle(theme.textPrimary)
-                            Spacer()
-                            if !health.dormantMemoryIDs.isEmpty {
-                                HStack(spacing: 3) {
-                                    Text("去筛选")
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 9, weight: .semibold))
-                                }
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(theme.accent)
-                            }
-                        }
-
-                        HStack(alignment: .firstTextBaseline, spacing: 6) {
-                            Text("\(health.dormantMemoryIDs.count)")
-                                .font(.system(size: 24, weight: .semibold, design: .rounded))
-                                .monospacedDigit()
-                                .foregroundStyle(health.dormantMemoryIDs.isEmpty ? theme.success : theme.warning)
-                            Text("条")
-                                .font(.caption)
-                                .foregroundStyle(theme.textSecondary)
-                        }
-
-                        Text("> 30 天未更新且零命中，适合定期复审或归档")
-                            .font(.caption2)
-                            .foregroundStyle(theme.textTertiary)
-                            .lineLimit(2)
-                        Spacer(minLength: 0)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .surfaceCard(cornerRadius: 12, padding: 13)
-                }
-                .buttonStyle(.plain)
-                .disabled(health.dormantMemoryIDs.isEmpty)
-            }
-            .fixedSize(horizontal: false, vertical: true)
-
-            // 3. Suspected Duplicate Pairs
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Label("疑似重复记忆对", systemImage: "square.on.square")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(theme.textPrimary)
-                    Text("\(health.duplicatePairs.count)")
-                        .font(.caption2.weight(.semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(health.duplicatePairs.isEmpty ? theme.success : theme.warning)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(health.duplicatePairs.isEmpty ? theme.successSoft : theme.warningSoft, in: Capsule())
-                    Spacer()
-                    if !health.duplicatePairs.isEmpty {
-                        Text("点击任意一对展开并排对比")
-                            .font(.caption2)
-                            .foregroundStyle(theme.textTertiary)
-                    }
-                }
-
-                if health.duplicatePairs.isEmpty {
-                    Text("当前活跃记忆语义分布良好，未检测到高相似度重复记忆对。")
-                        .font(.caption)
-                        .foregroundStyle(theme.textSecondary)
-                } else {
-                    VStack(spacing: 6) {
-                        ForEach(Array(health.duplicatePairs.prefix(5).enumerated()), id: \.offset) { _, pair in
-                            let memA = resolveMemory(id: pair.memoryAID)
-                            let memB = resolveMemory(id: pair.memoryBID)
-                            Button {
-                                guard let memA, let memB else { return }
-                                onNonDetailAction()
-                                ui.comparingDuplicate = DuplicateComparisonItem(
-                                    id: "\(pair.memoryAID)-\(pair.memoryBID)",
-                                    memoryA: memA,
-                                    memoryB: memB,
-                                    similarity: pair.similarity
-                                )
-                            } label: {
-                                HStack(spacing: 10) {
-                                    ScorePill(
-                                        label: "相似度",
-                                        value: "\(Int((pair.similarity * 100).rounded()))%",
-                                        tint: theme.warning
-                                    )
-                                    Text(memA?.title ?? String(pair.memoryAID.prefix(10)))
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(theme.textPrimary)
-                                        .lineLimit(1)
-                                    Image(systemName: "arrow.left.arrow.right")
-                                        .font(.caption2)
-                                        .foregroundStyle(theme.textTertiary)
-                                    Text(memB?.title ?? String(pair.memoryBID.prefix(10)))
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(theme.textPrimary)
-                                        .lineLimit(1)
-                                    Spacer()
-                                    Text("对比")
-                                        .font(.caption2.weight(.medium))
-                                        .foregroundStyle(theme.accent)
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundStyle(theme.textTertiary)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 8)
-                                .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .stroke(theme.hairlineBorder, lineWidth: 1)
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(memA == nil || memB == nil)
-                        }
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .surfaceCard(cornerRadius: 12, padding: 13)
-        }
-    }
-
-    private func resolveMemory(id: String) -> Memory? {
-        if let hit = model.hits.first(where: { $0.id == id }) {
-            return hit.memory
-        }
-        return try? model.memory(id: id, version: nil)
-    }
-
-    // MARK: - Wave 3 Semantic Galaxy Live Preview
-
-    private var galaxyPreviewContainer: some View {
-        let graph = model.memoryGraph
-        let duplicateEdges = graph.edges.filter { $0.kind == .duplicate }.count
-        return VStack(alignment: .leading, spacing: 10) {
-            SectionHeader("语义记忆星图") {
-                HStack(spacing: 6) {
-                    ScorePill(label: "节点", value: "\(graph.nodes.count)", tint: theme.accent)
-                    ScorePill(label: "连线", value: "\(graph.edges.count)", tint: theme.info)
-                    if duplicateEdges > 0 {
-                        ScorePill(label: "疑似重复", value: "\(duplicateEdges)", tint: theme.warning)
-                    }
-                    Button {
-                        onOpenGalaxy()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text("展开星图")
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: 10, weight: .semibold))
-                        }
-                    }
-                    .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
-                }
-            }
-
-            Button {
-                onOpenGalaxy()
-            } label: {
-                ZStack(alignment: .bottomTrailing) {
-                    MemoryGalaxyMiniPreview(
-                        graph: graph,
-                        pulseMemoryIDs: model.lastPulseMemoryIDs,
-                        pulseAgent: model.lastPulseAgent,
-                        pulseAt: model.lastPulseAt
-                    )
-                    .frame(height: 176)
-                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-
-                    HStack(spacing: 6) {
-                        Image(systemName: "sparkles")
-                            .font(.caption2)
-                            .foregroundStyle(theme.accent)
-                        Text(graph.nodes.isEmpty ? "进入交互式语义星图画布" : "点击展开完整星图 · 支持缩放、筛选与搜索聚焦")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(theme.textPrimary)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .overlay(Capsule().stroke(theme.hairlineBorder, lineWidth: 1))
-                    .padding(10)
-                }
-            }
-            .buttonStyle(.plain)
-        }
-        .surfaceCard(cornerRadius: 14, padding: 14)
-    }
 }
 
-// MARK: - Permanent "+" Extension Card
+// MARK: - Standalone "批量做梦" Apple Intelligence–Style Iridescent Nebula Capsule
 
-private struct AddAgentPlaceholderCard: View {
+private struct DreamResonanceCapsule: View {
     @Environment(\.theme) private var theme
+    let pendingCount: Int
+    let hasQueuedBatch: Bool
+    let isCopiedConfirmation: Bool
     let action: () -> Void
 
     @StateObject private var hovered = LocalState(false)
 
+    private var subtitleText: String {
+        if pendingCount > 0 {
+            return "待整理 \(pendingCount) 条新线索 · 点击复制"
+        }
+        if hasQueuedBatch {
+            return "有待整理对话 · 点击复制"
+        }
+        return "复制指令 · 整理记忆"
+    }
+
     var body: some View {
         let isHovered = hovered.value
-        Button(action: action) {
-            VStack(spacing: 8) {
-                Image(systemName: "plus")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(isHovered ? theme.accent : theme.textSecondary)
-                    .frame(width: 34, height: 34)
-                    .background(isHovered ? theme.accentSoft : theme.surfaceSecondary, in: Circle())
-                Text("接入更多 Agent")
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(isHovered ? theme.textPrimary : theme.textSecondary)
-                Text("更多 Agent 适配开发中")
-                    .font(.caption2)
-                    .foregroundStyle(theme.textTertiary)
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            let angle = Angle.degrees((t * (isHovered ? 115 : 44)).truncatingRemainder(dividingBy: 360))
+            let breathe = 0.88 + 0.12 * sin(t * 2.4)
+
+            Button(action: action) {
+                HStack(spacing: 12) {
+                    // Breathing crescent + sparkle icon
+                    ZStack {
+                        Circle()
+                            .fill(
+                                RadialGradient(
+                                    colors: [
+                                        (isCopiedConfirmation ? theme.success : theme.accent).opacity(theme.isDark ? 0.34 : 0.22),
+                                        Color.clear
+                                    ],
+                                    center: .center,
+                                    startRadius: 2,
+                                    endRadius: 20
+                                )
+                            )
+                            .frame(width: 34, height: 34)
+                            .scaleEffect(breathe)
+
+                        Image(systemName: isCopiedConfirmation ? "checkmark.circle.fill" : "moon.stars.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(
+                                isCopiedConfirmation
+                                    ? AnyShapeStyle(theme.success)
+                                    : AnyShapeStyle(
+                                        LinearGradient(
+                                            colors: [theme.accent, theme.agentAntigravity],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                            )
+                    }
+
+                    if isCopiedConfirmation {
+                        Text("✓ 做梦指令已复制 · 粘贴到 Agent 继续")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(theme.textPrimary)
+                            .lineLimit(1)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    } else {
+                        VStack(alignment: .leading, spacing: 1.5) {
+                            HStack(spacing: 6) {
+                                Text("批量做梦")
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(theme.textPrimary)
+                                if pendingCount > 0 {
+                                    Text("\(pendingCount)")
+                                        .font(.caption2.weight(.bold))
+                                        .monospacedDigit()
+                                        .foregroundStyle(theme.accent)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1.5)
+                                        .background(theme.accentSoft, in: Capsule())
+                                }
+                            }
+                            Text(subtitleText)
+                                .font(.caption2)
+                                .foregroundStyle(theme.textSecondary)
+                                .lineLimit(1)
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+
+                        HStack(spacing: 4) {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("复制")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundStyle(theme.accent)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(theme.accentSoft, in: Capsule())
+                        .overlay(Capsule().stroke(theme.accentBorder, lineWidth: 0.8))
+                    }
+                }
+                .padding(.leading, 12)
+                .padding(.trailing, isCopiedConfirmation ? 18 : 13)
+                .padding(.vertical, 9)
+                .background {
+                    ZStack {
+                        Capsule().fill(.ultraThinMaterial)
+                        Capsule().fill(theme.glassTint)
+                    }
+                }
+                .overlay {
+                    // Apple Intelligence–style flowing teal ↔ cyan ↔ indigo ↔ violet thin luminous edge
+                    Capsule()
+                        .strokeBorder(
+                            AngularGradient(
+                                gradient: Gradient(colors: isCopiedConfirmation
+                                    ? [theme.success, theme.accent, theme.success]
+                                    : [
+                                        theme.accent,
+                                        theme.info,
+                                        theme.agentAntigravity,
+                                        theme.scopeGlobal,
+                                        theme.accent
+                                    ]
+                                ),
+                                center: .center,
+                                angle: angle
+                            ),
+                            lineWidth: isHovered ? 2.0 : 1.5
+                        )
+                }
+                .shadow(
+                    color: (isCopiedConfirmation ? theme.success : theme.accent).opacity(theme.isDark ? (isHovered ? 0.34 : 0.20) : (isHovered ? 0.24 : 0.14)),
+                    radius: isHovered ? 20 : 13,
+                    y: isHovered ? 8 : 5
+                )
+                .shadow(color: theme.glassShadow, radius: 10, y: 4)
             }
-            .frame(maxWidth: .infinity, minHeight: 112, maxHeight: .infinity)
-            .padding(14)
-            .background(
-                (isHovered ? theme.surfaceElevated : theme.surfaceSecondary.opacity(0.65)),
-                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(
-                        isHovered ? theme.accentBorder : theme.strongBorder,
-                        style: StrokeStyle(lineWidth: 1.2, dash: [5, 4])
-                    )
-            )
+            .buttonStyle(.plain)
+            .scaleEffect(isHovered ? 1.035 : 1.0)
+            .offset(y: isHovered ? -2 : 0)
+            .animation(.spring(response: 0.34, dampingFraction: 0.72), value: isHovered)
+            .onHover { hovered.value = $0 }
+            .help("复制批量做梦指令到剪贴板，粘贴到 Agent 中整理近期对话为长期记忆")
         }
-        .buttonStyle(.plain)
-        .onHover { hovered.value = $0 }
-        .help("查看已支持的 Agent 与后续扩展计划")
     }
 }
 

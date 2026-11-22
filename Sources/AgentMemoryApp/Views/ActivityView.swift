@@ -67,7 +67,7 @@ struct ActivityView: View {
             }
             .padding(24)
         }
-        .background(theme.canvasBackground)
+        .background(Color.clear)
     }
 
     // MARK: - Cross-Agent Real-Time Hit Pulse Bar

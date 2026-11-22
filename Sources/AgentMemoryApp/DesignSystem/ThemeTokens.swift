@@ -275,12 +275,52 @@ struct ThemePalette: Equatable {
         agentAntigravity.opacity(isDark ? 0.16 : 0.11)
     }
 
-    // MARK: - Memory Galaxy Canvas Palette (Wave 3 ready)
+    // MARK: - Memory Galaxy Canvas Palette (Wave 3 & Wave 4)
 
     var galaxyBackground: Color {
         isDark
-            ? Color(red: 8 / 255, green: 10 / 255, blue: 16 / 255)
-            : Color(red: 241 / 255, green: 245 / 255, blue: 249 / 255)
+            ? Color(red: 7 / 255, green: 10 / 255, blue: 18 / 255)
+            : Color(red: 238 / 255, green: 244 / 255, blue: 252 / 255)
+    }
+
+    var galaxySkyTop: Color {
+        isDark
+            ? Color(red: 6 / 255, green: 9 / 255, blue: 17 / 255)
+            : Color(red: 232 / 255, green: 241 / 255, blue: 252 / 255)
+    }
+
+    var galaxySkyBottom: Color {
+        isDark
+            ? Color(red: 12 / 255, green: 16 / 255, blue: 28 / 255)
+            : Color(red: 247 / 255, green: 250 / 255, blue: 255 / 255)
+    }
+
+    var galaxyStardust: Color {
+        isDark
+            ? Color(red: 210 / 255, green: 228 / 255, blue: 255 / 255)
+            : Color(red: 71 / 255, green: 98 / 255, blue: 145 / 255)
+    }
+
+    var galaxyNebulaColors: [Color] {
+        if isDark {
+            return [
+                Color(red: 139 / 255, green: 92 / 255, blue: 246 / 255),  // Violet (Global)
+                Color(red: 45 / 255, green: 212 / 255, blue: 191 / 255),  // Teal
+                Color(red: 56 / 255, green: 189 / 255, blue: 248 / 255),  // Sky
+                Color(red: 129 / 255, green: 140 / 255, blue: 248 / 255), // Indigo
+                Color(red: 52 / 255, green: 211 / 255, blue: 153 / 255),  // Emerald
+                Color(red: 244 / 255, green: 114 / 255, blue: 182 / 255)  // Nebula Rose
+            ]
+        } else {
+            return [
+                Color(red: 109 / 255, green: 40 / 255, blue: 217 / 255),  // Violet (Global)
+                Color(red: 13 / 255, green: 148 / 255, blue: 136 / 255),  // Teal
+                Color(red: 2 / 255, green: 132 / 255, blue: 199 / 255),   // Sky
+                Color(red: 79 / 255, green: 70 / 255, blue: 229 / 255),   // Indigo
+                Color(red: 5 / 255, green: 150 / 255, blue: 105 / 255),   // Emerald
+                Color(red: 219 / 255, green: 39 / 255, blue: 119 / 255)   // Nebula Rose
+            ]
+        }
     }
 
     var galaxyGrid: Color {
@@ -288,7 +328,39 @@ struct ThemePalette: Equatable {
     }
 
     var galaxyEdge: Color {
-        isDark ? Color.white.opacity(0.16) : Color.black.opacity(0.15)
+        isDark ? Color.white.opacity(0.22) : Color(red: 30 / 255, green: 58 / 255, blue: 95 / 255).opacity(0.22)
+    }
+
+    // MARK: - Liquid Glass Surface Tokens (Wave 4)
+
+    var glassTint: Color {
+        isDark
+            ? Color(red: 14 / 255, green: 19 / 255, blue: 31 / 255).opacity(0.46)
+            : Color.white.opacity(0.58)
+    }
+
+    var glassPanelTint: Color {
+        isDark
+            ? Color(red: 10 / 255, green: 13 / 255, blue: 21 / 255).opacity(0.76)
+            : Color(red: 252 / 255, green: 254 / 255, blue: 255 / 255).opacity(0.82)
+    }
+
+    var glassSpecularTop: Color {
+        isDark ? Color.white.opacity(0.26) : Color.white.opacity(0.92)
+    }
+
+    var glassSpecularMid: Color {
+        isDark ? Color.white.opacity(0.09) : Color.black.opacity(0.07)
+    }
+
+    var glassSpecularBottom: Color {
+        isDark ? Color.white.opacity(0.04) : Color.black.opacity(0.10)
+    }
+
+    var glassShadow: Color {
+        isDark
+            ? Color.black.opacity(0.48)
+            : Color(red: 15 / 255, green: 23 / 255, blue: 42 / 255).opacity(0.11)
     }
 
     // MARK: - Shadows
