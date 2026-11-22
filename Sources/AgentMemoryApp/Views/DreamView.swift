@@ -56,12 +56,13 @@ struct DreamView: View {
             Button("复制做梦指令") {
                 model.copyDreamInstructions()
             }
+            .buttonStyle(SoftActionButtonStyle())
             Button {
                 model.copyBatchDream()
             } label: {
                 Label("批量做梦", systemImage: "moon.stars")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(PrimaryActionButtonStyle())
             .disabled(model.dashboard?.queuedThrough == nil)
             .help("复制批量做梦指令，粘贴到 Agent 中处理当前待做梦记录")
         }
@@ -182,6 +183,7 @@ struct DreamView: View {
                     } label: {
                         Label("整批撤销", systemImage: "arrow.uturn.backward")
                     }
+                    .buttonStyle(SoftActionButtonStyle(tint: summary.canRollback ? theme.warning : nil, compact: true))
                     .disabled(!summary.canRollback)
                     .help(summary.canRollback ? "回滚此批次应用的所有记忆变更" : "此批次无可回滚变更，或其中记忆已被后续批次修改")
                 }
@@ -281,16 +283,18 @@ private struct DreamProposalDiffCard: View {
                     } label: {
                         Label("详情", systemImage: "sidebar.right")
                     }
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
                     .help("在右侧检查器查看完整版本与证据")
 
                     if decision.status == "review" {
                         Button("拒绝") {
                             onReview(false)
                         }
+                        .buttonStyle(SoftActionButtonStyle(tint: theme.danger, compact: true))
                         Button("确认写入") {
                             onReview(true)
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(PrimaryActionButtonStyle(compact: true))
                     }
                 }
             }

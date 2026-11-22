@@ -33,6 +33,20 @@ enum AppPage: String, CaseIterable, Identifiable {
     }
 }
 
+enum MemoryDisplayMode: String, CaseIterable, Identifiable {
+    case list = "列表"
+    case galaxy = "星图"
+
+    var id: Self { self }
+
+    var icon: String {
+        switch self {
+        case .list: return "list.bullet.rectangle"
+        case .galaxy: return "sparkles"
+        }
+    }
+}
+
 extension RuntimeHealth.CaptureState {
     func presentation(smartCapture: Bool) -> (title: String, kind: RuntimeStatusKind, spinning: Bool) {
         switch self {

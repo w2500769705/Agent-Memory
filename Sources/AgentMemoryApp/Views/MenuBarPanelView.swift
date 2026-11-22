@@ -226,14 +226,14 @@ struct MenuBarPanelView: View {
                     Label("打开主窗口", systemImage: "macwindow")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
+                .buttonStyle(PrimaryActionButtonStyle(compact: true))
 
                 Button {
                     Task { await model.scanAllEnabled(force: true) }
                 } label: {
                     Label("立即扫描", systemImage: "arrow.clockwise")
                 }
+                .buttonStyle(SoftActionButtonStyle(compact: true))
                 .disabled(!model.isAnySourceEnabled || model.isAnyScanning || model.store == nil)
             }
 

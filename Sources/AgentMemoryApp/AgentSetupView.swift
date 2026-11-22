@@ -31,14 +31,13 @@ struct AgentSetupView: View {
                     (selectedAgent == .antigravity && model.checkingAntigravity) {
                     ProgressView().controlSize(.small)
                 }
-                Picker("Agent", selection: $selectedAgent) {
-                    ForEach(AgentBrand.allCases) { agent in
-                        Text(agent.rawValue).tag(agent)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 218)
+                SegmentedPillBar(
+                    options: AgentBrand.allCases,
+                    selection: $selectedAgent,
+                    label: { $0.rawValue },
+                    icon: { $0.icon },
+                    compact: true
+                )
                 .accessibilityLabel("选择 Agent")
             }
 
@@ -102,10 +101,11 @@ struct AgentSetupView: View {
                 Spacer()
                 if model.connection?.registered != true {
                     Button("连接 Codex") { model.configureCodex(.connect) }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(PrimaryActionButtonStyle(compact: true))
                         .disabled(model.checkingConnection || model.store == nil)
                 }
                 Button("验证连接") { model.configureCodex() }
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
                     .disabled(model.checkingConnection || model.store == nil)
             }
             Divider().overlay(theme.hairlineBorder)
@@ -119,6 +119,7 @@ struct AgentSetupView: View {
                     if model.enabled { Task { await model.scan(force: true) } }
                     else { model.capture(true) }
                 }
+                .buttonStyle(SoftActionButtonStyle(tint: model.enabled ? theme.accent : nil, compact: true))
                 .disabled(model.scanning || model.store == nil)
             }
             Divider().overlay(theme.hairlineBorder)
@@ -131,17 +132,22 @@ struct AgentSetupView: View {
                     if model.connection?.recallInstalled == true {
                         if !recallVerified {
                             Button("在终端审核") { model.openHookReview() }
+                                .buttonStyle(SoftActionButtonStyle(compact: true))
                         }
                         Button(recallVerified ? "再次验证" : "打开 Codex 验证") { model.openRecallTest() }
+                            .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
                     } else {
                         Button("修复 Hook 配置") { model.configureCodex(.enableRecall) }
+                            .buttonStyle(SoftActionButtonStyle(tint: theme.warning, compact: true))
                             .disabled(model.checkingConnection)
                     }
                     Button("关闭") { model.configureCodex(.disableRecall) }
+                        .buttonStyle(SoftActionButtonStyle(compact: true))
                         .disabled(model.checkingConnection)
                         .accessibilityLabel("关闭自动检索")
                 } else {
                     Button("配置自动检索") { model.configureCodex(.enableRecall) }
+                        .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
                         .disabled(model.checkingConnection || model.connection?.toolsAvailable != true)
                 }
             }
@@ -196,10 +202,11 @@ struct AgentSetupView: View {
                         copyState.antigravityConnectRequested = true
                         model.configureAntigravity(.connect)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(PrimaryActionButtonStyle(compact: true))
                     .disabled(model.checkingAntigravity || model.store == nil)
                 }
                 Button("验证连接") { model.configureAntigravity() }
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
                     .disabled(model.checkingAntigravity || model.store == nil)
             }
             if model.antigravityConnection?.registered == true {
@@ -241,6 +248,7 @@ struct AgentSetupView: View {
                     if model.antigravityEnabled { Task { await model.scanAntigravity(force: true) } }
                     else { model.captureAntigravity(true) }
                 }
+                .buttonStyle(SoftActionButtonStyle(tint: model.antigravityEnabled ? theme.accent : nil, compact: true))
                 .disabled(model.antigravityScanning || model.store == nil)
             }
             Divider().overlay(theme.hairlineBorder)
@@ -257,15 +265,19 @@ struct AgentSetupView: View {
                             model.copyAntigravityRecallTestPrompt()
                             copyState.copiedVerify = true
                         }
+                        .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
                     } else {
                         Button("修复 Hook 配置") { model.configureAntigravity(.enableRecall) }
+                            .buttonStyle(SoftActionButtonStyle(tint: theme.warning, compact: true))
                             .disabled(model.checkingAntigravity)
                     }
                     Button("关闭") { model.configureAntigravity(.disableRecall) }
+                        .buttonStyle(SoftActionButtonStyle(compact: true))
                         .disabled(model.checkingAntigravity)
                         .accessibilityLabel("关闭 Antigravity 自动检索")
                 } else {
                     Button("配置自动检索") { model.configureAntigravity(.enableRecall) }
+                        .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
                         .disabled(model.checkingAntigravity || model.antigravityConnection?.toolsAvailable != true)
                 }
             }

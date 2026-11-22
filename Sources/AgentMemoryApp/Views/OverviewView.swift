@@ -32,6 +32,7 @@ struct OverviewView: View {
     let onInspectMemoryID: (String) -> Void
     let onOpenAgentSettings: (AgentBrand) -> Void
     let onInspectDormantMemories: () -> Void
+    let onOpenGalaxy: () -> Void
     let onNonDetailAction: () -> Void
 
     @StateObject private var ui = OverviewUIState()
@@ -162,12 +163,11 @@ struct OverviewView: View {
                             .monospacedDigit()
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
-                            .background(Color.white.opacity(0.22), in: Capsule())
+                            .background(Color.black.opacity(0.16), in: Capsule())
                     }
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            .buttonStyle(PrimaryActionButtonStyle())
             .disabled(model.dashboard?.queuedThrough == nil)
             .help(model.dashboard?.queuedThrough == nil ? "当前暂无待做梦记录" : "复制批量做梦指令到剪贴板，粘贴到 Agent 中处理待做梦记录")
         }
@@ -350,10 +350,11 @@ struct OverviewView: View {
                     ui.showAddAgentHint = false
                     onOpenAgentSettings(.codex)
                 }
+                .buttonStyle(SoftActionButtonStyle())
                 Button("知道了") {
                     ui.showAddAgentHint = false
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(PrimaryActionButtonStyle())
             }
         }
         .padding(22)
@@ -644,8 +645,9 @@ struct OverviewView: View {
                         }
                         Spacer()
                     }
+                    Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .surfaceCard(cornerRadius: 12, padding: 13)
 
                 // 2. Dormant Memories (>30 days untouched & 0 hits)
@@ -685,6 +687,7 @@ struct OverviewView: View {
                             .font(.caption2)
                             .foregroundStyle(theme.textTertiary)
                             .lineLimit(2)
+                        Spacer(minLength: 0)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .surfaceCard(cornerRadius: 12, padding: 13)
@@ -785,35 +788,61 @@ struct OverviewView: View {
         return try? model.memory(id: id, version: nil)
     }
 
-    // MARK: - Wave 3 Semantic Galaxy Placeholder
+    // MARK: - Wave 3 Semantic Galaxy Live Preview
 
     private var galaxyPreviewContainer: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let graph = model.memoryGraph
+        let duplicateEdges = graph.edges.filter { $0.kind == .duplicate }.count
+        return VStack(alignment: .leading, spacing: 10) {
             SectionHeader("语义记忆星图") {
-                ScorePill(label: "Wave 3", value: "即将上线", tint: theme.accent)
-            }
-            ZStack {
-                GalaxyConstellationPreview(theme: theme, memoryCount: model.dashboard?.memories ?? 0)
-                    .frame(height: 170)
-                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                VStack(spacing: 6) {
-                    Text("Memory Galaxy · 语义关联画布")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(theme.textPrimary)
-                    Text("将基于纯原生 SwiftUI Canvas 渲染活跃节点、命中热度、向量相似连线与重复簇提示。")
-                        .font(.caption)
-                        .foregroundStyle(theme.textSecondary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 380)
+                HStack(spacing: 6) {
+                    ScorePill(label: "节点", value: "\(graph.nodes.count)", tint: theme.accent)
+                    ScorePill(label: "连线", value: "\(graph.edges.count)", tint: theme.info)
+                    if duplicateEdges > 0 {
+                        ScorePill(label: "疑似重复", value: "\(duplicateEdges)", tint: theme.warning)
+                    }
+                    Button {
+                        onOpenGalaxy()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("展开星图")
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                    }
+                    .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(theme.hairlineBorder, lineWidth: 1)
-                )
             }
+
+            Button {
+                onOpenGalaxy()
+            } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    MemoryGalaxyMiniPreview(
+                        graph: graph,
+                        pulseMemoryIDs: model.lastPulseMemoryIDs,
+                        pulseAgent: model.lastPulseAgent,
+                        pulseAt: model.lastPulseAt
+                    )
+                    .frame(height: 176)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.caption2)
+                            .foregroundStyle(theme.accent)
+                        Text(graph.nodes.isEmpty ? "进入交互式语义星图画布" : "点击展开完整星图 · 支持缩放、筛选与搜索聚焦")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(theme.textPrimary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(theme.hairlineBorder, lineWidth: 1))
+                    .padding(10)
+                }
+            }
+            .buttonStyle(.plain)
         }
         .surfaceCard(cornerRadius: 14, padding: 14)
     }
@@ -901,6 +930,7 @@ private struct DuplicatePairComparisonSheet: View {
             HStack {
                 Spacer()
                 Button("关闭", action: onClose)
+                    .buttonStyle(SoftActionButtonStyle())
                     .keyboardShortcut(.cancelAction)
             }
         }
@@ -946,73 +976,11 @@ private struct DuplicatePairComparisonSheet: View {
                     onInspectMemory(memory.id)
                 } label: {
                     Label("在检查器查看", systemImage: "sidebar.right")
-                        .font(.caption)
                 }
+                .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .surfaceCard(cornerRadius: 11, padding: 13)
-    }
-}
-
-// MARK: - Galaxy Preview Canvas
-
-private struct GalaxyConstellationPreview: View {
-    let theme: ThemePalette
-    let memoryCount: Int
-
-    private let sampleNodes: [(x: CGFloat, y: CGFloat, r: CGFloat, isGlobal: Bool)] = [
-        (0.14, 0.34, 5.5, false),
-        (0.24, 0.68, 4.5, true),
-        (0.36, 0.28, 7.0, false),
-        (0.47, 0.62, 5.0, false),
-        (0.58, 0.36, 8.0, true),
-        (0.71, 0.66, 6.0, false),
-        (0.83, 0.30, 5.0, true),
-        (0.88, 0.64, 4.0, false)
-    ]
-
-    private let sampleEdges: [(Int, Int)] = [
-        (0, 1), (0, 2), (1, 3), (2, 3), (2, 4), (3, 4), (4, 5), (4, 6), (5, 7), (6, 7)
-    ]
-
-    var body: some View {
-        Canvas { context, size in
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(theme.galaxyBackground))
-
-            let step: CGFloat = 24
-            var x: CGFloat = step / 2
-            while x < size.width {
-                var y: CGFloat = step / 2
-                while y < size.height {
-                    let dot = CGRect(x: x - 0.75, y: y - 0.75, width: 1.5, height: 1.5)
-                    context.fill(Path(ellipseIn: dot), with: .color(theme.galaxyGrid))
-                    y += step
-                }
-                x += step
-            }
-
-            let points = sampleNodes.map { CGPoint(x: $0.x * size.width, y: $0.y * size.height) }
-
-            for (from, to) in sampleEdges {
-                var path = Path()
-                path.move(to: points[from])
-                path.addLine(to: points[to])
-                context.stroke(path, with: .color(theme.galaxyEdge), lineWidth: 1)
-            }
-
-            for (index, node) in sampleNodes.enumerated() {
-                let p = points[index]
-                let color = node.isGlobal ? theme.scopeGlobal : theme.scopeProject
-                let glowRect = CGRect(x: p.x - node.r * 2.2, y: p.y - node.r * 2.2, width: node.r * 4.4, height: node.r * 4.4)
-                context.fill(Path(ellipseIn: glowRect), with: .color(color.opacity(theme.isDark ? 0.22 : 0.16)))
-                let coreRect = CGRect(x: p.x - node.r, y: p.y - node.r, width: node.r * 2, height: node.r * 2)
-                context.fill(Path(ellipseIn: coreRect), with: .color(color))
-            }
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .stroke(theme.hairlineBorder, lineWidth: 1)
-        )
     }
 }

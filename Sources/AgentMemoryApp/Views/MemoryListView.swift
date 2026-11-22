@@ -29,7 +29,9 @@ struct MemoryListView: View {
     @ObservedObject var model: AppModel
     var searchFocused: FocusState<Bool>.Binding
     @Binding var filterDormantOnly: Bool
+    @Binding var displayMode: MemoryDisplayMode
     let onSelectMemory: (SearchHit) -> Void
+    let onInspectMemoryID: (String) -> Void
 
     @StateObject private var searchState = MemorySearchState()
 
@@ -83,72 +85,29 @@ struct MemoryListView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            filterHeader
-
-            if let error = searchState.searchError {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(theme.warning)
-                    Text(error)
-                        .font(.caption)
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(displayMode == .galaxy ? "语义记忆星图" : "记忆与检索透视")
+                        .font(.title2.weight(.semibold))
                         .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    Button("重试") { runInspectSearch(debounce: false) }
+                    Text(displayMode == .galaxy ? "交互式语义拓扑、相似簇与跨 Agent 实时命中脉搏" : "支持四档作用域检索、Vector / BM25 / RRF 分项透视与边缘过滤排查")
                         .font(.caption)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(theme.warningSoft, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
-
-            if displayedHits.isEmpty && filteredCandidates.isEmpty {
-                Spacer(minLength: 12)
-                EmptyStateCard(
-                    icon: filterDormantOnly ? "moon.zzz" : "magnifyingglass",
-                    title: emptyStateTitle,
-                    description: emptyStateDescription,
-                    actionTitle: hasActiveFilter ? "清除筛选" : nil
-                ) {
-                    model.query = ""
-                    searchState.scopeMode = .all
-                    model.projectFilter = false
-                    filterDormantOnly = false
-                    runInspectSearch(debounce: false)
+                        .foregroundStyle(theme.textSecondary)
                 }
                 Spacer()
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        if displayedHits.isEmpty && !filteredCandidates.isEmpty {
-                            HStack(spacing: 8) {
-                                Image(systemName: "line.3.horizontal.decrease.circle")
-                                    .foregroundStyle(theme.warning)
-                                Text("没有直接命中的记忆，但下方有 \(filteredCandidates.count) 条边缘过滤候选可供透视排查。")
-                                    .font(.callout)
-                                    .foregroundStyle(theme.textSecondary)
-                                Spacer()
-                            }
-                            .surfaceCard(cornerRadius: 10, padding: 12)
-                        } else {
-                            ForEach(displayedHits) { hit in
-                                MemoryCardRow(
-                                    hit: hit,
-                                    isSelected: model.selectedMemory?.id == hit.id,
-                                    isDormant: dormantIDSet.contains(hit.id),
-                                    isFilteredCandidate: false
-                                ) {
-                                    onSelectMemory(hit)
-                                }
-                            }
-                        }
+                SegmentedPillBar(
+                    options: MemoryDisplayMode.allCases,
+                    selection: $displayMode,
+                    label: { $0.rawValue },
+                    icon: { $0.icon },
+                    compact: true
+                )
+            }
 
-                        if !filteredCandidates.isEmpty {
-                            filteredCandidatesPanel
-                                .padding(.top, 6)
-                        }
-                    }
-                    .padding(.bottom, 12)
-                }
+            if displayMode == .galaxy {
+                MemoryGalaxyView(model: model, onSelectMemoryID: onInspectMemoryID)
+            } else {
+                listContent
             }
         }
         .padding(20)
@@ -157,10 +116,21 @@ struct MemoryListView: View {
             if model.projectFilter && !model.project.isEmpty {
                 searchState.scopeMode = .projectAndGlobal
             }
-            runInspectSearch(debounce: false)
+            if displayMode == .galaxy {
+                model.refreshMemoryGraph()
+            } else {
+                runInspectSearch(debounce: false)
+            }
         }
         .onDisappear {
             searchState.inspectTask?.cancel()
+        }
+        .onChange(of: displayMode) { _, mode in
+            if mode == .galaxy {
+                model.refreshMemoryGraph()
+            } else {
+                runInspectSearch(debounce: false)
+            }
         }
         .onChange(of: searchState.scopeMode) { _, newValue in
             if newValue.needsProjectPath && model.project.isEmpty, let first = knownProjects.first {
@@ -170,7 +140,80 @@ struct MemoryListView: View {
             runInspectSearch(debounce: false)
         }
         .onChange(of: model.dashboard?.memories) { _, _ in
-            runInspectSearch(debounce: false)
+            if displayMode == .list {
+                runInspectSearch(debounce: false)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var listContent: some View {
+        filterHeader
+
+        if let error = searchState.searchError {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(theme.warning)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(theme.textPrimary)
+                Spacer()
+                Button("重试") { runInspectSearch(debounce: false) }
+                    .buttonStyle(SoftActionButtonStyle(tint: theme.warning, compact: true))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(theme.warningSoft, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+
+        if displayedHits.isEmpty && filteredCandidates.isEmpty {
+            Spacer(minLength: 12)
+            EmptyStateCard(
+                icon: filterDormantOnly ? "moon.zzz" : "magnifyingglass",
+                title: emptyStateTitle,
+                description: emptyStateDescription,
+                actionTitle: hasActiveFilter ? "清除筛选" : nil
+            ) {
+                model.query = ""
+                searchState.scopeMode = .all
+                model.projectFilter = false
+                filterDormantOnly = false
+                runInspectSearch(debounce: false)
+            }
+            Spacer()
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if displayedHits.isEmpty && !filteredCandidates.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "line.3.horizontal.decrease.circle")
+                                .foregroundStyle(theme.warning)
+                            Text("没有直接命中的记忆，但下方有 \(filteredCandidates.count) 条边缘过滤候选可供透视排查。")
+                                .font(.callout)
+                                .foregroundStyle(theme.textSecondary)
+                            Spacer()
+                        }
+                        .surfaceCard(cornerRadius: 10, padding: 12)
+                    } else {
+                        ForEach(displayedHits) { hit in
+                            MemoryCardRow(
+                                hit: hit,
+                                isSelected: model.selectedMemory?.id == hit.id,
+                                isDormant: dormantIDSet.contains(hit.id),
+                                isFilteredCandidate: false
+                            ) {
+                                onSelectMemory(hit)
+                            }
+                        }
+                    }
+
+                    if !filteredCandidates.isEmpty {
+                        filteredCandidatesPanel
+                            .padding(.top, 6)
+                    }
+                }
+                .padding(.bottom, 12)
+            }
         }
     }
 
@@ -278,14 +321,12 @@ struct MemoryListView: View {
                         .stroke(searchFocused.wrappedValue ? theme.accentBorder : theme.hairlineBorder, lineWidth: 1)
                 )
 
-                Picker("作用域", selection: $searchState.scopeMode) {
-                    ForEach(MemoryScopeMode.allCases) { item in
-                        Text(item.rawValue).tag(item)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 300)
+                SegmentedPillBar(
+                    options: MemoryScopeMode.allCases,
+                    selection: $searchState.scopeMode,
+                    label: { $0.rawValue },
+                    compact: true
+                )
             }
 
             if searchState.scopeMode.needsProjectPath {

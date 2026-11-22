@@ -5,6 +5,7 @@ import SwiftUI
 private final class ShellState: ObservableObject {
     @Published var selection: AppPage = .overview
     @Published var setupAgent: AgentBrand = .codex
+    @Published var memoryDisplayMode: MemoryDisplayMode = .list
     @Published var filterDormantOnly = false
     @Published var pickedDecision: Decision?
     @Published var pendingUndo: String?
@@ -126,11 +127,12 @@ struct MainShellView: View {
                 HStack {
                     Spacer()
                     Button("取消") { state.showBackfill = false }
+                        .buttonStyle(SoftActionButtonStyle())
                     Button("开始回填") {
                         model.capture(true, since: state.backfillDate)
                         state.showBackfill = false
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(PrimaryActionButtonStyle())
                 }
             }
             .padding(24)
@@ -238,17 +240,23 @@ struct MainShellView: View {
                 onInspectMemoryID: { memoryID in inspectMemory(id: memoryID) },
                 onOpenAgentSettings: { agent in openAgentSettings(agent) },
                 onInspectDormantMemories: { inspectDormantMemories() },
+                onOpenGalaxy: { openMemoryGalaxy() },
                 onNonDetailAction: { state.inspectorPresented = false }
             )
         case .memory:
             MemoryListView(
                 model: model,
                 searchFocused: $searchFocused,
-                filterDormantOnly: $state.filterDormantOnly
-            ) { hit in
-                model.show(hit)
-                state.inspectorPresented = true
-            }
+                filterDormantOnly: $state.filterDormantOnly,
+                displayMode: $state.memoryDisplayMode,
+                onSelectMemory: { hit in
+                    model.show(hit)
+                    state.inspectorPresented = true
+                },
+                onInspectMemoryID: { memoryID in
+                    inspectMemory(id: memoryID)
+                }
+            )
         case .dream:
             DreamView(
                 model: model,
@@ -333,6 +341,7 @@ struct MainShellView: View {
 
     private func focusMemorySearch() {
         state.pendingInspectMemoryID = nil
+        state.memoryDisplayMode = .list
         state.inspectorPresented = false
         state.selection = .memory
         DispatchQueue.main.async {
@@ -342,6 +351,7 @@ struct MainShellView: View {
 
     private func searchFromOverview(_ query: String) {
         state.pendingInspectMemoryID = nil
+        state.memoryDisplayMode = .list
         state.filterDormantOnly = false
         model.query = query
         state.inspectorPresented = false
@@ -360,11 +370,21 @@ struct MainShellView: View {
 
     private func inspectDormantMemories() {
         state.pendingInspectMemoryID = nil
+        state.memoryDisplayMode = .list
         model.query = ""
         model.projectFilter = false
         state.filterDormantOnly = true
         state.inspectorPresented = false
         state.selection = .memory
+    }
+
+    private func openMemoryGalaxy() {
+        state.pendingInspectMemoryID = nil
+        state.filterDormantOnly = false
+        state.memoryDisplayMode = .galaxy
+        state.inspectorPresented = false
+        state.selection = .memory
+        model.refreshMemoryGraph()
     }
 
     private func inspectMemory(id memoryID: String) {

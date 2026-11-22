@@ -230,12 +230,13 @@ struct InspectorView: View {
                             model.review(decision, accept: false)
                             pickedDecision = nil
                         }
+                        .buttonStyle(SoftActionButtonStyle(tint: theme.danger))
                         .frame(maxWidth: .infinity)
                         Button("确认写入") {
                             model.review(decision, accept: true)
                             pickedDecision = nil
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(PrimaryActionButtonStyle())
                         .frame(maxWidth: .infinity)
                     }
                 }

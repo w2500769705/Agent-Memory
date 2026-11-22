@@ -13,12 +13,18 @@ struct SettingsView: View {
             }
 
             Section("外观主题") {
-                Picker("主题模式", selection: $model.themeMode) {
-                    ForEach(AppThemeMode.allCases) { mode in
-                        Label(mode.label, systemImage: mode.icon).tag(mode)
-                    }
+                HStack {
+                    Text("主题模式")
+                        .foregroundStyle(theme.textPrimary)
+                    Spacer()
+                    SegmentedPillBar(
+                        options: AppThemeMode.allCases,
+                        selection: $model.themeMode,
+                        label: { $0.label },
+                        icon: { $0.icon },
+                        compact: true
+                    )
                 }
-                .pickerStyle(.segmented)
                 Text("支持跟随 macOS 系统外观自动切换，或手动锁定深色 / 浅色模式。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -52,6 +58,7 @@ struct SettingsView: View {
                 Toggle("全局采集 Codex 聊天", isOn: Binding(get: { model.enabled }, set: { model.capture($0) }))
                 Toggle("全局采集 Antigravity 聊天", isOn: Binding(get: { model.antigravityEnabled }, set: { model.captureAntigravity($0) }))
                 Button("选择日期回填 Codex 聊天…") { showBackfill = true }
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
             }
 
             Section("启动与关闭") {
@@ -72,11 +79,13 @@ struct SettingsView: View {
                     ForEach(model.excludedProjects, id: \.self) { value in
                         LabeledContent(value) {
                             Button("取消排除") { model.removeExclusion(value, byProject: true) }
+                                .buttonStyle(SoftActionButtonStyle(compact: true))
                         }
                     }
                     ForEach(model.excludedThreads, id: \.self) { value in
                         LabeledContent(value) {
                             Button("取消排除") { model.removeExclusion(value, byProject: false) }
+                                .buttonStyle(SoftActionButtonStyle(compact: true))
                         }
                     }
                 }

@@ -329,7 +329,7 @@ struct EmptyStateCard: View {
             }
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(PrimaryActionButtonStyle())
                     .padding(.top, 4)
             }
         }
@@ -372,5 +372,137 @@ struct CopyToastBanner: View {
                 .stroke(theme.accentBorder, lineWidth: 1)
         )
         .shadow(color: theme.cardShadow, radius: 14, y: 6)
+    }
+}
+
+// MARK: - Unified Custom Segmented Control (Replaces Default macOS Segmented Picker)
+
+struct SegmentedPillBar<Option: Hashable & Identifiable>: View {
+    @Environment(\.theme) private var theme
+    let options: [Option]
+    @Binding var selection: Option
+    let label: (Option) -> String
+    var icon: ((Option) -> String?)? = nil
+    var compact: Bool = false
+
+    @StateObject private var hoveredOption = LocalState<Option?>(nil)
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options) { option in
+                let isSelected = selection == option
+                let isHovered = hoveredOption.value == option
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        selection = option
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        if let systemImage = icon?(option) {
+                            Image(systemName: systemImage)
+                                .font(.system(size: compact ? 10 : 11, weight: .semibold))
+                        }
+                        Text(label(option))
+                            .font(compact ? .caption.weight(isSelected ? .semibold : .medium) : .callout.weight(isSelected ? .semibold : .medium))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .foregroundStyle(isSelected ? theme.accent : (isHovered ? theme.textPrimary : theme.textSecondary))
+                    .padding(.horizontal, compact ? 9 : 11)
+                    .padding(.vertical, compact ? 4.5 : 5.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: compact ? 6.5 : 7, style: .continuous)
+                            .fill(
+                                isSelected
+                                    ? (theme.isDark ? theme.surfaceElevated : theme.surfacePrimary)
+                                    : (isHovered ? theme.surfacePrimary.opacity(theme.isDark ? 0.45 : 0.65) : Color.clear)
+                            )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: compact ? 6.5 : 7, style: .continuous)
+                            .fill(isSelected ? theme.accent.opacity(theme.isDark ? 0.12 : 0.08) : Color.clear)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: compact ? 6.5 : 7, style: .continuous)
+                            .stroke(isSelected ? theme.accent.opacity(theme.isDark ? 0.36 : 0.28) : Color.clear, lineWidth: 1)
+                    )
+                    .shadow(color: isSelected ? theme.cardShadow.opacity(theme.isDark ? 0.65 : 0.85) : .clear, radius: 2.5, y: 1)
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    hoveredOption.value = hovering ? option : (hoveredOption.value == option ? nil : hoveredOption.value)
+                }
+            }
+        }
+        .padding(3)
+        .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: compact ? 9 : 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: compact ? 9 : 10, style: .continuous)
+                .stroke(theme.hairlineBorder, lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Refined Action Button Styles
+
+struct SoftActionButtonStyle: ButtonStyle {
+    @Environment(\.theme) private var theme
+    @Environment(\.isEnabled) private var isEnabled
+    var tint: Color? = nil
+    var compact: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        let accent = tint
+        configuration.label
+            .font(compact ? .caption.weight(.medium) : .callout.weight(.medium))
+            .foregroundStyle(
+                !isEnabled
+                    ? theme.textTertiary
+                    : (accent ?? theme.textPrimary)
+            )
+            .padding(.horizontal, compact ? 9 : 12)
+            .padding(.vertical, compact ? 4.5 : 6)
+            .background(
+                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
+                    .fill(
+                        configuration.isPressed
+                            ? (accent?.opacity(theme.isDark ? 0.22 : 0.16) ?? theme.surfaceElevated)
+                            : (accent?.opacity(theme.isDark ? 0.13 : 0.09) ?? theme.surfaceSecondary)
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
+                    .stroke(
+                        accent?.opacity(isEnabled ? 0.32 : 0.14) ?? theme.hairlineBorder,
+                        lineWidth: 1
+                    )
+            )
+            .opacity(isEnabled ? 1 : 0.58)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+struct PrimaryActionButtonStyle: ButtonStyle {
+    @Environment(\.theme) private var theme
+    @Environment(\.isEnabled) private var isEnabled
+    var compact: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
+            .foregroundStyle(theme.isDark ? Color(red: 9 / 255, green: 14 / 255, blue: 18 / 255) : Color.white)
+            .padding(.horizontal, compact ? 10 : 13)
+            .padding(.vertical, compact ? 5 : 6.5)
+            .background(
+                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
+                    .fill(theme.accent.opacity(configuration.isPressed ? 0.82 : 1.0))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
+                    .stroke(theme.accent.opacity(0.45), lineWidth: 1)
+            )
+            .shadow(color: isEnabled ? theme.accent.opacity(theme.isDark ? 0.22 : 0.18) : .clear, radius: 5, y: 2)
+            .opacity(isEnabled ? 1 : 0.45)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

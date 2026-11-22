@@ -61,12 +61,94 @@ struct ActivityView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 headerRow
+                livePulseBar
                 sourceHealthRow
                 timelineSection
             }
             .padding(24)
         }
         .background(theme.canvasBackground)
+    }
+
+    // MARK: - Cross-Agent Real-Time Hit Pulse Bar
+
+    @ViewBuilder
+    private var livePulseBar: some View {
+        if let pulseAt = model.lastPulseAt, !model.lastPulseMemoryIDs.isEmpty {
+            let agentBrand = model.lastPulseAgent?.brand
+            let accent = agentBrand?.color(in: theme) ?? theme.accent
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    ZStack {
+                        Circle()
+                            .fill(accent.opacity(theme.isDark ? 0.25 : 0.18))
+                            .frame(width: 18, height: 18)
+                        Circle()
+                            .fill(accent)
+                            .frame(width: 8, height: 8)
+                            .shadow(color: accent.opacity(0.65), radius: 3)
+                    }
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text("实时命中脉搏")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(theme.textPrimary)
+                            if let agentBrand {
+                                AgentTag(agent: agentBrand)
+                            }
+                            Text("命中 \(model.lastPulseMemoryIDs.count) 条记忆")
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                        Text("最近一次触发于 \(pulseAt.formatted(.dateTime.hour().minute().second()))")
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(model.lastPulseMemoryIDs.prefix(4), id: \.self) { memoryID in
+                            let title = memoryTitleLookup[memoryID]
+                                ?? (try? model.memory(id: memoryID, version: nil))?.title
+                                ?? String(memoryID.prefix(10))
+                            Button {
+                                onInspectMemoryID(memoryID)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "bolt.fill")
+                                        .font(.system(size: 9, weight: .semibold))
+                                    Text(title)
+                                        .font(.caption2.weight(.medium))
+                                        .lineLimit(1)
+                                }
+                                .foregroundStyle(accent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(accent.opacity(theme.isDark ? 0.15 : 0.10), in: Capsule())
+                                .overlay(Capsule().stroke(accent.opacity(0.32), lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                            .help("点击查看命中记忆「\(title)」")
+                        }
+                    }
+                }
+                .frame(maxWidth: 360, alignment: .trailing)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(theme.surfacePrimary, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .stroke(accent.opacity(0.32), lineWidth: 1)
+            )
+            .shadow(color: theme.cardShadow, radius: 4, y: 2)
+        }
     }
 
     // MARK: - Header
@@ -98,6 +180,7 @@ struct ActivityView: View {
                 } label: {
                     Label(model.isAnyScanning ? "扫描中…" : "立即扫描", systemImage: "arrow.clockwise")
                 }
+                .buttonStyle(SoftActionButtonStyle(compact: true))
                 .disabled(!model.isAnySourceEnabled || model.isAnyScanning)
             }
         }
@@ -170,8 +253,10 @@ struct ActivityView: View {
 
             HStack(spacing: 8) {
                 Button(enabled ? "暂停采集" : "启用采集", action: onToggle)
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
                     .disabled(model.store == nil)
                 Button("立即扫描", action: onScan)
+                    .buttonStyle(SoftActionButtonStyle(tint: theme.accent, compact: true))
                     .disabled(!enabled || isScanning || model.store == nil)
                 Spacer()
             }
@@ -195,14 +280,12 @@ struct ActivityView: View {
                 .pickerStyle(.menu)
                 .frame(width: 124)
 
-                Picker("事件类型", selection: $kindFilter.value) {
-                    ForEach(ActivityEventFilter.allCases) { item in
-                        Text(item.rawValue).tag(item)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 360)
+                SegmentedPillBar(
+                    options: ActivityEventFilter.allCases,
+                    selection: $kindFilter.value,
+                    label: { $0.rawValue },
+                    compact: true
+                )
             }
 
             if filteredEvents.isEmpty {
