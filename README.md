@@ -3,9 +3,37 @@
 > **Local-first cross-agent memory hub for macOS** — 让 Codex、Antigravity 等多个 AI 编程 Agent 共享同一颗本地长期记忆大脑。
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-000000?style=flat-square&logo=apple)
+![Version](https://img.shields.io/badge/version-v0.4.0-0EA5E9?style=flat-square)
 ![Swift](https://img.shields.io/badge/Swift-6.0%20%7C%20SwiftUI-F05138?style=flat-square&logo=swift)
 ![Storage](https://img.shields.io/badge/Storage-SQLite%20%2B%20Local%20Embeddings-0D9488?style=flat-square)
 ![Protocol](https://img.shields.io/badge/Protocol-MCP%20%2B%20PreInvocation%20Hook-6366F1?style=flat-square)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/overview-dark.jpg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/overview-light.jpg">
+    <img alt="Agent Memory Overview" src="docs/screenshots/overview-dark.jpg" width="100%">
+  </picture>
+</p>
+
+---
+
+## 界面预览
+
+| 深色模式 · 概览与 3D 记忆星系 | 浅色模式 · 液态玻璃与宝石星核 |
+| :---: | :---: |
+| ![深色模式概览](docs/screenshots/overview-dark.jpg) | ![浅色模式概览](docs/screenshots/overview-light.jpg) |
+
+| 记忆检索透视与右侧检查器 | 运行活动与自动注入原文展开 |
+| :---: | :---: |
+| ![记忆与检索透视](docs/screenshots/memory-inspector.jpg) | ![运行活动与自动注入](docs/screenshots/activity-recall.jpg) |
+
+<details>
+<summary>点击查看：设置页（多 Agent 连接向导 & 项目路径迁移 / 合并）</summary>
+
+![设置页](docs/screenshots/settings.jpg)
+
+</details>
 
 ---
 
@@ -28,14 +56,18 @@
   - 结合本地向量相似度与 BM25 关键词混合排序（RRF），配合停用词过滤、技术词信号识别、严格相关度门槛与 12 轮会话去重，避免把不相关记忆塞进上下文。
   - 注入结果附带日期锚点，明确提示“用户当前要求优先、以较新日期为准”，防止与宿主自带记忆或最新需求冲突。
 - **3D 弹性语义星系与液态玻璃空间界面**：
-  - 纯原生 SwiftUI `Canvas` 驱动的 3D 缓缓旋转记忆星系：语义相近的记忆自动聚合成星系并渲染柔和星云底晕，支持 360° 拖拽旋转、抓取单颗星点弹性拉扯、点击直达详情检查器。
+  - 纯原生 SwiftUI `Canvas` 驱动的 3D 缓缓旋转记忆星系：按项目统一星系与配色、32° 侧上方俯视视角与柔和星云底晕，支持 360° 拖拽旋转、抓取单颗星点弹性拉扯、点击直达详情检查器。
   - 当 Codex 或 Antigravity 实时检索命中记忆时，星图对应节点与星云会实时亮起脉冲光环。
-  - 完整支持 **跟随系统 / 深色 / 浅色** 三态外观无缝切换。
+  - 完整支持 **跟随系统 / 深色 / 浅色** 三态外观与 **卡片玻璃不透明度（25%–100%）** 自定义。
 - **做梦中心（Dream Center）与可追溯审计**：
-  - 一键复制「批量做梦」指令交由 Agent 提炼长期记忆，所有拟议变更进入待审队列。
+  - 一键复制「批量做梦」指令交由 Agent 提炼长期记忆，所有拟议变更进入待审队列；概览页实时提醒待确认与冲突提案。
   - 支持「旧内容 vs 拟议变更」并排对比、展开原始对话证据摘录、逐条确认/拒绝，以及按批次一键撤销回滚。
-- **记忆健康度体检**：
-  - 自动统计活跃/归档分布、识别 30 天零命中的沉睡记忆与高相似度疑似重复对，支持并排对比与定期清理。
+- **100 分制记忆健康度体检与归档管理**：
+  - 按疑似重复对、30 天沉睡比例与活跃规模计算 100 分制健康度（归档不扣分），并给出手动修复与 Agent 辅助修复双路径。
+  - 完整支持「已归档」记忆列表检索、随时恢复与两段式二次确认永久删除（删后保留证据状态防止重复采集）。
+- **活动可观测性与项目路径迁移**：
+  - 活动页实时展示 Codex / Antigravity 采集与命中脉搏，点击自动注入日志可展开查看命中的记忆列表与**完整注入原文**。
+  - 内置「项目路径迁移 / 合并」（支持设置页一键原子迁移或通过 `agent-memory-mcp --migrate-project` 交由 Agent 执行），轻松应对目录重命名或合并。
 - **低功耗多 Agent 接入**：
   - 基于 macOS FSEvents 事件驱动监听 + 防抖策略，长驻菜单栏几乎零功耗。
   - 内置 **Codex** 与 **Antigravity** 一键配置向导与状态自检，支持跨项目自动注入开关。
@@ -88,7 +120,7 @@ open "dist/Agent Memory.app"
 # 仅编译
 swift build
 
-# 运行核心冒烟测试（21 项覆盖存储、检索、做梦、构图与脉搏）
+# 运行核心冒烟测试（30 项覆盖存储、检索、做梦、迁移、归档、构图与脉搏）
 swift run AgentMemorySmoke
 ```
 
@@ -114,8 +146,10 @@ swift run AgentMemorySmoke
 ├── Tests/
 │   └── AgentMemorySmoke/       # 自动化冒烟测试套件
 ├── Resources/                  # 应用图标与资源
+├── docs/screenshots/           # README 界面预览截图
 ├── scripts/
 │   └── build-app.sh            # 一键构建与本地签名 Release .app 脚本
+├── VERSION                     # SemVer 版本号
 └── DEVELOPMENT.md              # 详细开发与架构说明
 ```
 
