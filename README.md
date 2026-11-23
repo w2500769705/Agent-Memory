@@ -4,6 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-000000?style=flat-square&logo=apple)
 ![Version](https://img.shields.io/badge/version-v0.4.0-0EA5E9?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square)
 ![Swift](https://img.shields.io/badge/Swift-6.0%20%7C%20SwiftUI-F05138?style=flat-square&logo=swift)
 ![Storage](https://img.shields.io/badge/Storage-SQLite%20%2B%20Local%20Embeddings-0D9488?style=flat-square)
 ![Protocol](https://img.shields.io/badge/Protocol-MCP%20%2B%20PreInvocation%20Hook-6366F1?style=flat-square)
@@ -103,7 +104,7 @@ flowchart LR
 ### 1. 克隆并构建 Release `.app`
 
 ```bash
-git clone git@github.com:w2500769705/Agent-Memory.git
+git clone https://github.com/w2500769705/Agent-Memory.git
 cd Agent-Memory
 scripts/build-app.sh
 ```
@@ -168,4 +169,4 @@ swift run AgentMemorySmoke
 
 ## License
 
-暂未指定开源协议（建议在公开仓库后根据需要添加 `MIT` 或 `Apache-2.0` License）。
+本项目采用 [MIT License](LICENSE) 开源。
