@@ -42,6 +42,7 @@ enum ActivityAgentFilter: String, CaseIterable, Identifiable {
 struct ActivityView: View {
     @Environment(\.theme) private var theme
     @ObservedObject var model: AppModel
+    @Binding var pendingFilter: ActivityEventFilter?
     let onInspectMemoryID: (String) -> Void
 
     @StateObject private var kindFilter = LocalState(ActivityEventFilter.all)
@@ -68,6 +69,12 @@ struct ActivityView: View {
             .padding(24)
         }
         .background(Color.clear)
+        .onChange(of: pendingFilter, initial: true) { _, filter in
+            guard let filter else { return }
+            kindFilter.value = filter
+            agentFilter.value = .all
+            pendingFilter = nil
+        }
     }
 
     // MARK: - Cross-Agent Real-Time Hit Pulse Bar
@@ -310,7 +317,19 @@ struct ActivityView: View {
         }
     }
 
+    @ViewBuilder
     private func activityRow(_ event: ActivityEvent) -> some View {
+        if event.kind == .recall {
+            RecallActivityRow(event: event, model: model, onInspectMemoryID: onInspectMemoryID) { expanded in
+                activitySummary(event, expanded: expanded)
+            }
+        } else {
+            activitySummary(event)
+                .surfaceCard(cornerRadius: 11, padding: 12)
+        }
+    }
+
+    private func activitySummary(_ event: ActivityEvent, expanded: Bool? = nil) -> some View {
         let style = eventStyle(event.kind)
         return HStack(alignment: .top, spacing: 12) {
             Image(systemName: style.icon)
@@ -335,9 +354,17 @@ struct ActivityView: View {
                         .font(.caption2)
                         .monospacedDigit()
                         .foregroundStyle(theme.textTertiary)
+
+                    if let expanded {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(theme.textSecondary)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                            .accessibilityHidden(true)
+                    }
                 }
 
-                if let message = event.message, !message.isEmpty {
+                if event.kind != .recall, let message = event.message, !message.isEmpty {
                     Text(message)
                         .font(.caption)
                         .foregroundStyle(event.kind == .error ? theme.danger : theme.textSecondary)
@@ -373,7 +400,7 @@ struct ActivityView: View {
                 }
 
                 // Clickable Memory ID chips
-                if !event.memoryIDs.isEmpty {
+                if event.kind != .recall, !event.memoryIDs.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
                             ForEach(event.memoryIDs, id: \.self) { memoryID in
@@ -404,7 +431,6 @@ struct ActivityView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .surfaceCard(cornerRadius: 11, padding: 12)
     }
 
     private func countLabel(for kind: ActivityEvent.Kind) -> String {
@@ -436,5 +462,120 @@ struct ActivityView: View {
         case .error:
             return ("运行异常", "exclamationmark.triangle.fill", theme.danger)
         }
+    }
+}
+
+private struct RecallActivityRow<Summary: View>: View {
+    @Environment(\.theme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let event: ActivityEvent
+    let model: AppModel
+    let onInspectMemoryID: (String) -> Void
+    @ViewBuilder let summary: (Bool) -> Summary
+
+    @StateObject private var recalledMemories = LocalState<[Memory]?>(nil)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                let next = recalledMemories.value == nil ? loadRecalledMemories() : nil
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
+                    recalledMemories.value = next
+                }
+            } label: {
+                summary(recalledMemories.value != nil)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(recalledMemories.value == nil ? "展开命中记忆和注入原文" : "收起注入详情")
+
+            if let memories = recalledMemories.value {
+                recallDetails(memories)
+                    .transition(.opacity)
+            }
+        }
+        .surfaceCard(cornerRadius: 11, padding: 12, highlighted: recalledMemories.value != nil)
+    }
+
+    private func loadRecalledMemories() -> [Memory] {
+        var seen = Set<String>()
+        let ids = event.memoryIDs.filter { seen.insert($0).inserted }
+        return model.memories(ids: ids)
+    }
+
+    private func recallDetails(_ memories: [Memory]) -> some View {
+        let missing = Set(event.memoryIDs).count - memories.count
+
+        return VStack(alignment: .leading, spacing: 9) {
+            Text("命中的记忆")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.textPrimary)
+
+            ForEach(memories) { memory in
+                Button {
+                    onInspectMemoryID(memory.id)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .foregroundStyle(theme.accent)
+                            .accessibilityHidden(true)
+                        Text(memory.title)
+                            .foregroundStyle(theme.textPrimary)
+                            .multilineTextAlignment(.leading)
+                        Spacer(minLength: 4)
+                        ScopeTag(projectPath: memory.project)
+                        if memory.archived {
+                            Text("已归档")
+                                .font(.caption2)
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(SoftActionButtonStyle(compact: true))
+                .help("打开右侧检查器")
+            }
+
+            if event.memoryIDs.isEmpty {
+                Text("此日志没有命中记忆记录")
+                    .font(.caption)
+                    .foregroundStyle(theme.textSecondary)
+            } else if missing > 0 {
+                Text("有 \(missing) 条命中记忆已无法查看")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(theme.textSecondary)
+            }
+
+            Divider()
+            if let original = event.message, !original.isEmpty {
+                HStack(spacing: 8) {
+                    Text("实际注入原文")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(theme.textPrimary)
+                    Spacer()
+                    Button {
+                        model.copyInstruction(original, message: "已复制注入原文")
+                    } label: {
+                        Label("复制注入原文", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
+                }
+
+                Text(original)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(theme.textPrimary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(11)
+                    .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                Text("历史日志未记录原文")
+                    .font(.caption)
+                    .foregroundStyle(theme.textSecondary)
+            }
+        }
+        .padding(.leading, 4)
     }
 }

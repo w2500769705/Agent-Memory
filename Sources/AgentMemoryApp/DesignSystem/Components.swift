@@ -53,7 +53,7 @@ struct StatusCapsule: View {
                     .shadow(color: kind.color(in: theme).opacity(theme.isDark ? 0.65 : 0.3), radius: 3)
             }
             Text(title)
-                .font(.caption.weight(.medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(kind == .paused ? theme.textSecondary : kind.color(in: theme))
                 .lineLimit(1)
         }
@@ -105,7 +105,7 @@ struct AgentTag: View {
                 .fill(active ? agent.color(in: theme) : theme.textTertiary)
                 .frame(width: 6, height: 6)
             Text(agent.rawValue)
-                .font(.caption.weight(.medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(active ? agent.color(in: theme) : theme.textSecondary)
         }
         .padding(.horizontal, 8)
@@ -133,9 +133,9 @@ struct ScopeTag: View {
         let bg = isGlobal ? theme.scopeGlobalSoft : theme.scopeProjectSoft
         HStack(spacing: 4) {
             Image(systemName: isGlobal ? "globe" : "folder")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
             Text(label)
-                .font(.caption.weight(.medium))
+                .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
         }
         .foregroundStyle(fg)
@@ -157,10 +157,10 @@ struct ScorePill: View {
         let color = tint ?? theme.textSecondary
         HStack(spacing: 4) {
             Text(label)
-                .font(.caption2.weight(.medium))
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(theme.textTertiary)
             Text(value)
-                .font(.caption2.weight(.semibold))
+                .font(.system(size: 11.5, weight: .semibold))
                 .monospacedDigit()
                 .foregroundStyle(color)
         }
@@ -257,10 +257,10 @@ struct SectionHeader<Trailing: View>: View {
                 .foregroundStyle(theme.textPrimary)
             if let count {
                 Text("\(count)")
-                    .font(.caption2.weight(.semibold))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .monospacedDigit()
                     .foregroundStyle(theme.textSecondary)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 7)
                     .padding(.vertical, 2)
                     .background(theme.surfaceSecondary, in: Capsule())
                     .overlay(Capsule().stroke(theme.hairlineBorder, lineWidth: 1))
@@ -400,10 +400,11 @@ struct SegmentedPillBar<Option: Hashable & Identifiable>: View {
                     HStack(spacing: 5) {
                         if let systemImage = icon?(option) {
                             Image(systemName: systemImage)
-                                .font(.system(size: compact ? 10 : 11, weight: .semibold))
+                                .font(.system(size: compact ? 11.5 : 12.5, weight: .semibold))
                         }
                         Text(label(option))
-                            .font(compact ? .caption.weight(isSelected ? .semibold : .medium) : .callout.weight(isSelected ? .semibold : .medium))
+                            .font(compact ? .system(size: 12, weight: isSelected ? .semibold : .medium) : .system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                            .monospacedDigit()
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
@@ -454,14 +455,14 @@ struct SoftActionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         let accent = tint
         configuration.label
-            .font(compact ? .caption.weight(.medium) : .callout.weight(.medium))
+            .font(compact ? .system(size: 12, weight: .medium) : .system(size: 12.5, weight: .medium))
             .foregroundStyle(
                 !isEnabled
                     ? theme.textTertiary
                     : (accent ?? theme.textPrimary)
             )
-            .padding(.horizontal, compact ? 9 : 12)
-            .padding(.vertical, compact ? 4.5 : 6)
+            .padding(.horizontal, compact ? 10 : 12)
+            .padding(.vertical, compact ? 5 : 6.5)
             .background(
                 RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
                     .fill(
@@ -489,10 +490,10 @@ struct PrimaryActionButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
+            .font(compact ? .system(size: 12, weight: .semibold) : .system(size: 12.5, weight: .semibold))
             .foregroundStyle(theme.isDark ? Color(red: 9 / 255, green: 14 / 255, blue: 18 / 255) : Color.white)
-            .padding(.horizontal, compact ? 10 : 13)
-            .padding(.vertical, compact ? 5 : 6.5)
+            .padding(.horizontal, compact ? 11 : 13)
+            .padding(.vertical, compact ? 5.5 : 7)
             .background(
                 RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
                     .fill(theme.accent.opacity(configuration.isPressed ? 0.82 : 1.0))
@@ -509,6 +510,46 @@ struct PrimaryActionButtonStyle: ButtonStyle {
 
 // MARK: - Wave 4 Liquid Glass Surfaces
 
+enum GlassOpacityPreference {
+    static let key = "agentMemory.glassOpacity"
+    static let defaultValue = 0.82
+    static let range = 0.25...1.0
+
+    static func clamped(_ value: Double) -> Double {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    static func materialOpacity(for value: Double, isPanel: Bool) -> Double {
+        let normalized = (clamped(value) - range.lowerBound) / (range.upperBound - range.lowerBound)
+        let floor = isPanel ? 0.35 : 0.20
+        return floor + normalized * (1.0 - floor)
+    }
+
+    static func tintOpacity(for value: Double, isPanel: Bool) -> Double {
+        let normalized = (clamped(value) - range.lowerBound) / (range.upperBound - range.lowerBound)
+        let floor = isPanel ? 0.15 : 0.06
+        return floor + normalized * (1.0 - floor)
+    }
+}
+
+struct LiquidGlassFill<Surface: Shape>: View {
+    @Environment(\.theme) private var theme
+    @AppStorage(GlassOpacityPreference.key) private var opacity = GlassOpacityPreference.defaultValue
+    let shape: Surface
+    var isPanel = false
+
+    var body: some View {
+        let materialAlpha = GlassOpacityPreference.materialOpacity(for: opacity, isPanel: isPanel)
+        let tintAlpha = GlassOpacityPreference.tintOpacity(for: opacity, isPanel: isPanel)
+        ZStack {
+            shape.fill(isPanel ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(.ultraThinMaterial))
+                .opacity(materialAlpha)
+            shape.fill(isPanel ? theme.glassPanelTint : theme.glassTint)
+                .opacity(tintAlpha)
+        }
+    }
+}
+
 struct LiquidGlassSurfaceModifier: ViewModifier {
     @Environment(\.theme) private var theme
     let cornerRadius: CGFloat
@@ -520,8 +561,7 @@ struct LiquidGlassSurfaceModifier: ViewModifier {
         content
             .background {
                 ZStack {
-                    shape.fill(isPanel ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(.ultraThinMaterial))
-                    shape.fill(isPanel ? theme.glassPanelTint : theme.glassTint)
+                    LiquidGlassFill(shape: shape, isPanel: isPanel)
                     if highlighted {
                         shape.fill(
                             LinearGradient(
@@ -570,10 +610,7 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background {
-                ZStack {
-                    Capsule().fill(.ultraThinMaterial)
-                    Capsule().fill(theme.glassTint)
-                }
+                LiquidGlassFill(shape: Capsule())
             }
             .overlay {
                 Capsule().strokeBorder(
@@ -604,5 +641,60 @@ extension View {
 
     func liquidGlassCapsule(highlighted: Bool = false) -> some View {
         modifier(LiquidGlassCapsuleModifier(highlighted: highlighted))
+    }
+}
+
+// MARK: - Auto-Wrapping Flow Layout
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var lineSpacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var usedWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: maxWidth.isFinite ? maxWidth : nil, height: nil))
+            if currentX > 0 && currentX + size.width > maxWidth {
+                currentX = 0
+                currentY += lineHeight + lineSpacing
+                lineHeight = 0
+            }
+            usedWidth = max(usedWidth, currentX + size.width)
+            currentX += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+
+        return CGSize(
+            width: maxWidth.isFinite ? maxWidth : usedWidth,
+            height: currentY + lineHeight
+        )
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxWidth = bounds.width
+        var currentX = bounds.minX
+        var currentY = bounds.minY
+        var lineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+            if currentX > bounds.minX && currentX + size.width > bounds.maxX {
+                currentX = bounds.minX
+                currentY += lineHeight + lineSpacing
+                lineHeight = 0
+            }
+            subview.place(
+                at: CGPoint(x: currentX, y: currentY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: min(size.width, maxWidth), height: size.height)
+            )
+            currentX += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
     }
 }

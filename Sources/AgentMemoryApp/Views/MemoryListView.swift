@@ -14,6 +14,11 @@ private enum MemoryScopeMode: String, CaseIterable, Identifiable {
     }
 }
 
+private struct MemoryReviewRequest: Equatable {
+    let ids: Set<String>
+    let graphNodes: [MemoryGraphNode]
+}
+
 @MainActor
 private final class MemorySearchState: ObservableObject {
     @Published var scopeMode: MemoryScopeMode = .all
@@ -21,6 +26,7 @@ private final class MemorySearchState: ObservableObject {
     @Published var isSearching = false
     @Published var searchError: String?
     @Published var showFilteredCandidates = false
+    @Published var reviewHits: [SearchHit] = []
     var inspectTask: Task<Void, Never>?
 }
 
@@ -28,7 +34,7 @@ struct MemoryListView: View {
     @Environment(\.theme) private var theme
     @ObservedObject var model: AppModel
     var searchFocused: FocusState<Bool>.Binding
-    @Binding var filterDormantOnly: Bool
+    @Binding var reviewMode: MemoryReviewMode
     @Binding var displayMode: MemoryDisplayMode
     let onSelectMemory: (SearchHit) -> Void
     let onInspectMemoryID: (String) -> Void
@@ -40,14 +46,11 @@ struct MemoryListView: View {
     }
 
     private var displayedHits: [SearchHit] {
-        let base = searchState.inspection?.hits ?? model.hits
-        guard filterDormantOnly else { return base }
-        return base.filter { dormantIDSet.contains($0.id) }
+        searchState.inspection?.hits ?? model.hits
     }
 
     private var filteredCandidates: [SearchHit] {
-        guard !filterDormantOnly else { return [] }
-        return searchState.inspection?.filteredCandidates ?? []
+        searchState.inspection?.filteredCandidates ?? []
     }
 
     private var knownProjects: [String] {
@@ -87,27 +90,36 @@ struct MemoryListView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(displayMode == .galaxy ? "语义记忆星图" : "记忆与检索透视")
+                    Text(displayMode == .archived ? "已归档记忆" : "记忆与检索透视")
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(theme.textPrimary)
-                    Text(displayMode == .galaxy ? "交互式语义拓扑、相似簇与跨 Agent 实时命中脉搏" : "支持四档作用域检索、Vector / BM25 / RRF 分项透视与边缘过滤排查")
-                        .font(.caption)
-                        .foregroundStyle(theme.textSecondary)
+                    if displayMode == .list && reviewMode == .standard {
+                        Text("支持四档作用域检索、Vector / BM25 / RRF 分项透视与边缘过滤排查")
+                            .font(.caption)
+                            .foregroundStyle(theme.textSecondary)
+                    }
                 }
                 Spacer()
                 SegmentedPillBar(
                     options: MemoryDisplayMode.allCases,
                     selection: $displayMode,
-                    label: { $0.rawValue },
+                    label: { $0.label(archivedCount: model.healthSummary.archivedCount) },
                     icon: { $0.icon },
                     compact: true
                 )
             }
 
-            if displayMode == .galaxy {
+            switch displayMode {
+            case .archived:
+                ArchivedMemoryList(model: model, searchFocused: searchFocused, onSelectMemory: onSelectMemory)
+            case .galaxy:
                 MemoryGalaxyView(model: model, mode: .interactiveFull, onSelectMemoryID: onInspectMemoryID)
-            } else {
-                listContent
+            case .list:
+                if reviewMode == .standard {
+                    listContent
+                } else {
+                    reviewContent
+                }
             }
         }
         .padding(20)
@@ -116,33 +128,30 @@ struct MemoryListView: View {
             if model.projectFilter && !model.project.isEmpty {
                 searchState.scopeMode = .projectAndGlobal
             }
-            if displayMode == .galaxy {
-                model.refreshMemoryGraph()
-            } else {
-                runInspectSearch(debounce: false)
+            if displayMode == .list && reviewMode == .standard {
+                let canShowCachedImmediately = model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && searchState.scopeMode == .all
+                    && !model.hits.isEmpty
+                runInspectSearch(debounce: false, initialDelayMs: canShowCachedImmediately ? 80 : 0)
             }
         }
         .onDisappear {
             searchState.inspectTask?.cancel()
         }
-        .onChange(of: displayMode) { _, mode in
-            if mode == .galaxy {
-                model.refreshMemoryGraph()
-            } else {
-                runInspectSearch(debounce: false)
-            }
+        .onChange(of: displayMode) { _, _ in updateSearch() }
+        .onChange(of: reviewMode) { _, _ in
+            searchState.reviewHits = []
+            updateSearch()
         }
         .onChange(of: searchState.scopeMode) { _, newValue in
             if newValue.needsProjectPath && model.project.isEmpty, let first = knownProjects.first {
                 model.project = first
             }
             model.projectFilter = newValue.needsProjectPath && model.project.hasPrefix("/")
-            runInspectSearch(debounce: false)
+            updateSearch()
         }
         .onChange(of: model.dashboard?.memories) { _, _ in
-            if displayMode == .list {
-                runInspectSearch(debounce: false)
-            }
+            updateSearch()
         }
     }
 
@@ -169,7 +178,7 @@ struct MemoryListView: View {
         if displayedHits.isEmpty && filteredCandidates.isEmpty {
             Spacer(minLength: 12)
             EmptyStateCard(
-                icon: filterDormantOnly ? "moon.zzz" : "magnifyingglass",
+                icon: "magnifyingglass",
                 title: emptyStateTitle,
                 description: emptyStateDescription,
                 actionTitle: hasActiveFilter ? "清除筛选" : nil
@@ -177,7 +186,6 @@ struct MemoryListView: View {
                 model.query = ""
                 searchState.scopeMode = .all
                 model.projectFilter = false
-                filterDormantOnly = false
                 runInspectSearch(debounce: false)
             }
             Spacer()
@@ -218,13 +226,10 @@ struct MemoryListView: View {
     }
 
     private var hasActiveFilter: Bool {
-        !model.query.isEmpty || searchState.scopeMode != .all || filterDormantOnly
+        !model.query.isEmpty || searchState.scopeMode != .all
     }
 
     private var emptyStateTitle: String {
-        if filterDormantOnly {
-            return "当前没有沉睡记忆"
-        }
         if needsValidProjectHint {
             return "请先选择或输入项目路径"
         }
@@ -232,9 +237,6 @@ struct MemoryListView: View {
     }
 
     private var emptyStateDescription: String {
-        if filterDormantOnly {
-            return "超过 30 天未更新且零命中的记忆会归类为沉睡记忆。"
-        }
         if needsValidProjectHint {
             return "请在上方输入绝对路径或点击下方已知项目胶囊，以按项目作用域透视检索结果。"
         }
@@ -243,11 +245,12 @@ struct MemoryListView: View {
             : "尝试更换关键词，或切换回「全部」作用域查看。"
     }
 
-    private func runInspectSearch(debounce: Bool) {
+    private func runInspectSearch(debounce: Bool, initialDelayMs: UInt64 = 0) {
         searchState.inspectTask?.cancel()
         let query = model.query
         let scope = resolvedScope
-        let waitMs: UInt64 = (debounce && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 180 : 0
+        let debounceMs: UInt64 = (debounce && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 180 : 0
+        let waitMs = max(debounceMs, initialDelayMs)
 
         searchState.inspectTask = Task {
             if waitMs > 0 {
@@ -278,6 +281,96 @@ struct MemoryListView: View {
         }
     }
 
+    private func updateSearch() {
+        if displayMode == .list && reviewMode == .standard {
+            runInspectSearch(debounce: false)
+        } else {
+            searchState.inspectTask?.cancel()
+            searchState.isSearching = false
+        }
+    }
+
+    private var reviewIDs: Set<String> {
+        let dormant = dormantIDSet
+        guard reviewMode == .leastUsed else { return dormant }
+        return dormant.union(model.memoryGraph.nodes.map(\.id)).union(model.hits.map(\.id))
+    }
+
+    private var reviewContent: some View {
+        let dormant = reviewMode == .dormant
+        let ids = reviewIDs
+        let request = MemoryReviewRequest(ids: ids, graphNodes: dormant ? [] : model.memoryGraph.nodes)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label(dormant ? "沉睡记忆" : "低频 / 最久未用", systemImage: dormant ? "moon.zzz" : "clock.arrow.circlepath")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(theme.warning)
+                    Text(dormant
+                         ? "超过 30 天未更新且零命中。"
+                         : "先按命中次数从少到多，再按最后使用时间从早到晚。")
+                        .font(.caption)
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer(minLength: 4)
+                Button("退出整理") { reviewMode = .standard }
+                    .buttonStyle(SoftActionButtonStyle(compact: true))
+            }
+            .surfaceCard(cornerRadius: 10, padding: 10)
+
+            if !dormant && !ids.isEmpty && ids.count < model.healthSummary.activeCount {
+                Text("本次整理范围 \(ids.count) / \(model.healthSummary.activeCount) 条活跃记忆")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(theme.textSecondary)
+            }
+
+            if ids.isEmpty {
+                EmptyStateCard(
+                    icon: dormant ? "moon.zzz" : "clock",
+                    title: dormant ? "当前没有沉睡记忆" : "暂无可整理的记忆",
+                    description: dormant ? "当前健康度诊断没有发现沉睡记忆。" : "活跃记忆加载后会显示在这里。"
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(searchState.reviewHits.filter { ids.contains($0.id) }) { hit in
+                            MemoryCardRow(
+                                hit: hit,
+                                isSelected: model.selectedMemory?.id == hit.id,
+                                isDormant: dormantIDSet.contains(hit.id),
+                                isFilteredCandidate: false,
+                                showsLastHit: !dormant
+                            ) {
+                                onSelectMemory(hit)
+                            }
+                        }
+                    }
+                    .padding(.bottom, 12)
+                }
+            }
+        }
+        .task(id: request) {
+            var hits: [SearchHit] = []
+            for (index, id) in ids.enumerated() {
+                if index.isMultiple(of: 25) { await Task.yield() }
+                guard !Task.isCancelled else { return }
+                if let memory = try? model.memory(id: id), !memory.archived {
+                    hits.append(SearchHit(memory: memory, vector: nil, keywordRank: nil, score: 0))
+                }
+            }
+            searchState.reviewHits = hits.sorted {
+                if dormant {
+                    return ($0.memory.updated, $0.id) < ($1.memory.updated, $1.id)
+                }
+                return ($0.memory.hitCount, $0.memory.lastHitAt ?? 0, $0.memory.updated, $0.id)
+                    < ($1.memory.hitCount, $1.memory.lastHitAt ?? 0, $1.memory.updated, $1.id)
+            }
+        }
+        .id(reviewMode)
+    }
+
     // MARK: - Filter & Telemetry Header
 
     private var filterHeader: some View {
@@ -289,10 +382,7 @@ struct MemoryListView: View {
                     TextField("搜索记忆标题、正文、技术词或版本号…", text: $model.query)
                         .textFieldStyle(.plain)
                         .focused(searchFocused)
-                        .onChange(of: model.query) { _, newValue in
-                            if !newValue.isEmpty && filterDormantOnly {
-                                filterDormantOnly = false
-                            }
+                        .onChange(of: model.query) { _, _ in
                             runInspectSearch(debounce: true)
                         }
                         .onSubmit {
@@ -393,31 +483,6 @@ struct MemoryListView: View {
                 }
             }
 
-            if filterDormantOnly {
-                HStack(spacing: 8) {
-                    Image(systemName: "moon.zzz.fill")
-                        .font(.caption)
-                        .foregroundStyle(theme.warning)
-                    Text("已筛选沉睡记忆（超过 30 天未更新且零命中）")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    Button("退出筛选") {
-                        filterDormantOnly = false
-                    }
-                    .buttonStyle(.plain)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(theme.accent)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(theme.warningSoft, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(theme.warning.opacity(0.30), lineWidth: 1)
-                )
-            }
-
             HStack(spacing: 8) {
                 Text("共 \(displayedHits.count) 条记忆")
                     .font(.caption)
@@ -499,12 +564,162 @@ struct MemoryListView: View {
     }
 }
 
+private struct ArchivedMemoryList: View {
+    @Environment(\.theme) private var theme
+    @ObservedObject var model: AppModel
+    var searchFocused: FocusState<Bool>.Binding
+    let onSelectMemory: (SearchHit) -> Void
+
+    @StateObject private var query = LocalState("")
+    @StateObject private var confirmingClear = LocalState(false)
+
+    private var archiveCount: Int { model.healthSummary.archivedCount }
+    private var searchQuery: String { query.value.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(theme.textTertiary)
+                    TextField("搜索已归档记忆的标题或正文…", text: $query.value)
+                        .textFieldStyle(.plain)
+                        .focused(searchFocused)
+                    if !query.value.isEmpty {
+                        Button {
+                            query.value = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(theme.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("清空搜索")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(theme.surfacePrimary, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(
+                    searchFocused.wrappedValue ? theme.accentBorder : theme.hairlineBorder
+                ))
+
+                if archiveCount > 0 {
+                    Button {
+                        confirmingClear.value = true
+                    } label: {
+                        Label("清空已归档", systemImage: "trash")
+                    }
+                    .buttonStyle(SoftActionButtonStyle(tint: theme.danger, compact: true))
+                    .help("永久删除全部已归档记忆，包括搜索结果之外的条目")
+                }
+            }
+
+            if model.archivedMemories.isEmpty {
+                EmptyStateCard(
+                    icon: "archivebox",
+                    title: searchQuery.isEmpty ? "暂无已归档记忆" : "没有匹配的已归档记忆",
+                    description: searchQuery.isEmpty ? "归档后可在这里恢复或永久删除记忆。" : "试试其他标题或正文关键词。"
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                if model.archivedMemories.count < archiveCount {
+                    Text("当前展示 \(model.archivedMemories.count) 条 · 共归档 \(archiveCount) 条")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(theme.textSecondary)
+                }
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(model.archivedMemories) { memory in
+                            archivedRow(memory)
+                        }
+                    }
+                    .padding(.bottom, 12)
+                }
+            }
+        }
+        .onChange(of: searchQuery, initial: true) { _, value in
+            model.refreshArchivedMemories(query: value)
+        }
+        .alert("永久清空所有已归档记忆？", isPresented: $confirmingClear.value) {
+            Button("取消", role: .cancel) {}
+            Button("永久清空", role: .destructive) { model.deleteAllArchivedMemories() }
+        } message: {
+            Text("将永久删除全部 \(archiveCount) 条已归档记忆及其版本历史，包括搜索结果之外的条目。此操作不可撤销。")
+        }
+    }
+
+    private func archivedRow(_ memory: Memory) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Button {
+                onSelectMemory(SearchHit(memory: memory, vector: nil, keywordRank: nil, score: 0))
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(memory.title)
+                        .font(.headline)
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(2)
+                    Text(memory.body)
+                        .font(.callout)
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("在右侧检查器查看记忆详情")
+
+            FlowLayout(spacing: 8, lineSpacing: 6) {
+                ScopeTag(projectPath: memory.project)
+                Text("归档于 \(Date(timeIntervalSince1970: memory.updated).formatted(.dateTime.year().month().day().hour().minute()))")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(theme.textSecondary)
+                Button {
+                    model.archiveMemory(id: memory.id, archived: false)
+                } label: {
+                    Label("恢复", systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(SoftActionButtonStyle(tint: theme.success, compact: true))
+                DeleteArchivedMemoryButton(title: memory.title) { model.deleteArchivedMemory(id: memory.id) }
+            }
+        }
+        .surfaceCard(cornerRadius: 12, padding: 14, highlighted: model.selectedMemory?.id == memory.id)
+    }
+}
+
+struct DeleteArchivedMemoryButton: View {
+    @Environment(\.theme) private var theme
+    let title: String
+    let delete: () -> Void
+
+    @StateObject private var confirming = LocalState(false)
+
+    var body: some View {
+        Button {
+            confirming.value = true
+        } label: {
+            Label("永久删除", systemImage: "trash")
+        }
+        .buttonStyle(SoftActionButtonStyle(tint: theme.danger, compact: true))
+        .alert("永久删除这条记忆？", isPresented: $confirming.value) {
+            Button("取消", role: .cancel) {}
+            Button("永久删除", role: .destructive, action: delete)
+        } message: {
+            Text("将永久删除「\(title)」及其版本历史。此操作不可撤销。")
+        }
+    }
+}
+
 private struct MemoryCardRow: View {
     @Environment(\.theme) private var theme
     let hit: SearchHit
     let isSelected: Bool
     let isDormant: Bool
     let isFilteredCandidate: Bool
+    var showsLastHit: Bool = false
     let action: () -> Void
 
     @StateObject private var hovered = LocalState(false)
@@ -526,7 +741,7 @@ private struct MemoryCardRow: View {
                         .font(.caption2.weight(.semibold))
                         .monospacedDigit()
                         .foregroundStyle(theme.textTertiary)
-                    Text(Date(timeIntervalSince1970: hit.memory.updated), format: .dateTime.month().day().hour().minute())
+                    Text(activityDate)
                         .font(.caption2)
                         .monospacedDigit()
                         .foregroundStyle(theme.textTertiary)
@@ -577,5 +792,14 @@ private struct MemoryCardRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovered.value = $0 }
+    }
+
+    private var activityDate: String {
+        if showsLastHit {
+            guard let lastHit = hit.memory.lastHitAt else { return "从未命中" }
+            let date = Date(timeIntervalSince1970: lastHit)
+            return "命中于 \(date.formatted(.dateTime.year().month().day()))"
+        }
+        return Date(timeIntervalSince1970: hit.memory.updated).formatted(.dateTime.month().day().hour().minute())
     }
 }

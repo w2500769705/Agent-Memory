@@ -243,6 +243,31 @@ public struct Dashboard: Sendable {
     public let batchSummaries: [DreamBatchSummary]
 }
 
+public struct ProjectSummary: Codable, Sendable, Equatable {
+    public let project: String
+    public let activeMemoryCount: Int
+    public let archivedMemoryCount: Int
+    public let queuedEvidenceCount: Int
+    public let claimedEvidenceCount: Int
+}
+
+public struct ProjectMigrationPreview: Codable, Sendable, Equatable {
+    public let fromProject: String
+    public let toProject: String
+    public let activeMemoryCount: Int
+    public let archivedMemoryCount: Int
+    public let queuedEvidenceCount: Int
+    public let doneEvidenceCount: Int
+    public let claimedEvidenceCount: Int
+}
+
+public struct ProjectMigrationResult: Codable, Sendable, Equatable {
+    public let fromProject: String
+    public let toProject: String
+    public let migratedMemoryCount: Int
+    public let migratedEvidenceCount: Int
+}
+
 public struct ActivityEvent: Identifiable, Sendable {
     public enum Kind: String, Sendable {
         case scan, recall, search, error

@@ -36,6 +36,7 @@ enum AppPage: String, CaseIterable, Identifiable {
 enum MemoryDisplayMode: String, CaseIterable, Identifiable {
     case list = "列表"
     case galaxy = "星图"
+    case archived = "已归档"
 
     var id: Self { self }
 
@@ -43,8 +44,19 @@ enum MemoryDisplayMode: String, CaseIterable, Identifiable {
         switch self {
         case .list: return "list.bullet.rectangle"
         case .galaxy: return "sparkles"
+        case .archived: return "archivebox"
         }
     }
+
+    func label(archivedCount: Int) -> String {
+        self == .archived ? "\(rawValue) (\(archivedCount))" : rawValue
+    }
+}
+
+enum MemoryReviewMode: Equatable {
+    case standard
+    case dormant
+    case leastUsed
 }
 
 extension RuntimeHealth.CaptureState {

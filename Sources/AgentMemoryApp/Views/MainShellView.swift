@@ -1,4 +1,5 @@
 import AgentMemoryCore
+import AppKit
 import SwiftUI
 
 @MainActor
@@ -6,23 +7,43 @@ private final class ShellState: ObservableObject {
     @Published var selection: AppPage = .overview
     @Published var setupAgent: AgentBrand = .codex
     @Published var memoryDisplayMode: MemoryDisplayMode = .list
-    @Published var filterDormantOnly = false
+    @Published var memoryReviewMode: MemoryReviewMode = .standard
+    @Published var pendingActivityFilter: ActivityEventFilter?
+    @Published var focusDreamProposals = false
     @Published var pickedDecision: Decision?
     @Published var pendingUndo: String?
     @Published var showBackfill = false
     @Published var backfillDate = Calendar.current.startOfDay(for: Date())
     @Published var inspectorPresented = false
+    @Published var inspectorWidth: CGFloat = 0
+    @Published var isHoveringInspectorResize = false
+    @Published var isDraggingInspectorResize = false
     @Published var pendingInspectMemoryID: String?
     @Published var sidebarExpanded = false
+    @Published var hoveredPage: AppPage? = nil
     @Published var dreamResonanceTrigger: Date? = nil
+    @Published var isWindowRenderingActive = true
 
+    var inspectorDragStartWidth: CGFloat? = nil
+    private var resizeCursorPushed = false
     private var sidebarCollapseTask: Task<Void, Never>?
+
+    func updateResizeCursor() {
+        let shouldShow = isHoveringInspectorResize || isDraggingInspectorResize
+        if shouldShow && !resizeCursorPushed {
+            NSCursor.resizeLeftRight.push()
+            resizeCursorPushed = true
+        } else if !shouldShow && resizeCursorPushed {
+            NSCursor.pop()
+            resizeCursorPushed = false
+        }
+    }
 
     func setSidebarHovered(_ hovering: Bool) {
         sidebarCollapseTask?.cancel()
         if hovering {
             if !sidebarExpanded {
-                withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
                     sidebarExpanded = true
                 }
             }
@@ -31,8 +52,9 @@ private final class ShellState: ObservableObject {
                 do { try await Task.sleep(for: .milliseconds(100)) }
                 catch { return }
                 guard !Task.isCancelled else { return }
-                withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                withAnimation(.easeOut(duration: 0.22)) {
                     self?.sidebarExpanded = false
+                    self?.hoveredPage = nil
                 }
             }
         }
@@ -49,67 +71,114 @@ struct MainShellView: View {
         state.selection == .memory && state.memoryDisplayMode == .galaxy
     }
 
+    private var isGalaxyActive: Bool {
+        state.selection == .overview || isFullScreenGalaxy
+    }
+
+    private func resolvedInspectorWidth(for windowWidth: CGFloat) -> CGFloat {
+        let defaultWidth = min(max(440, windowWidth * 0.40), 620)
+        let targetWidth = state.inspectorWidth > 0 ? state.inspectorWidth : defaultWidth
+        let maxAllowed = max(480, windowWidth * 0.65)
+        let clamped = min(max(targetWidth, 320), maxAllowed)
+        let narrowGuard = max(300, windowWidth - 280)
+        return min(clamped, narrowGuard)
+    }
+
     var body: some View {
-        ZStack(alignment: .leading) {
-            // Layer 0: Borderless Full-Window 3D Elastic Memory Galaxy
-            MemoryGalaxyView(
-                model: model,
-                mode: isFullScreenGalaxy ? .interactiveFull : .ambientBackdrop,
-                dreamResonanceTrigger: state.dreamResonanceTrigger,
-                onSelectMemoryID: { memoryID in
-                    inspectMemory(id: memoryID)
-                }
-            )
-            .ignoresSafeArea()
+        GeometryReader { windowProxy in
+            let windowWidth = windowProxy.size.width
+            let drawerWidth = resolvedInspectorWidth(for: windowWidth)
 
-            // Layer 1: Top 62pt Native Window Drag & Double-Click Zoom Region
-            WindowDragRegion()
-                .frame(maxWidth: .infinity)
-                .frame(height: 62)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .ignoresSafeArea(edges: .top)
-
-            // Layer 2: Spatial Content Area (cleared past the 54pt collapsed rail)
-            VStack(spacing: 0) {
-                if let error = model.error {
-                    ErrorBanner(message: error) {
-                        model.error = nil
+            ZStack(alignment: .leading) {
+                // Layer 0: Borderless Full-Window 3D Elastic Memory Galaxy (auto-paused on non-galaxy pages or inactive/occluded window)
+                MemoryGalaxyView(
+                    model: model,
+                    mode: isFullScreenGalaxy ? .interactiveFull : .ambientBackdrop,
+                    isPaused: !isGalaxyActive || !state.isWindowRenderingActive,
+                    isSidebarExpanded: state.sidebarExpanded,
+                    dreamResonanceTrigger: state.dreamResonanceTrigger,
+                    onSelectMemoryID: { memoryID in
+                        inspectMemory(id: memoryID)
+                    },
+                    onClearSelection: {
+                        clearSelection()
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .padding(.horizontal, 16)
-                    .padding(.top, 6)
-                }
+                )
+                .ignoresSafeArea()
 
-                contentLayer
+                // Layer 1: Top 62pt Native Window Drag & Double-Click Zoom Region
+                WindowDragRegion()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 62)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .ignoresSafeArea(edges: .top)
+
+                // Layer 2: Spatial Content Area + Resizable Liquid Glass Inspector Drawer
+                VStack(spacing: 0) {
+                    if let error = model.error {
+                        ErrorBanner(message: error) {
+                            model.error = nil
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                    }
+
+                    HStack(spacing: 0) {
+                        contentLayer
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        if state.inspectorPresented {
+                            inspectorResizeHandle(windowWidth: windowWidth, currentWidth: drawerWidth)
+
+                            InspectorView(
+                                model: model,
+                                selection: state.selection,
+                                pickedDecision: $state.pickedDecision,
+                                onClose: { clearSelection() }
+                            )
+                            .frame(width: drawerWidth)
+                            .frame(maxHeight: .infinity)
+                            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                            .liquidGlassSurface(cornerRadius: 20, panel: true)
+                            .padding(.top, 6)
+                            .padding(.bottom, 16)
+                            .padding(.trailing, 16)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                        }
+                    }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .padding(.leading, 68)
+                    .animation(.spring(response: 0.30, dampingFraction: 0.82), value: state.inspectorPresented)
+                }
+                .padding(.leading, 68)
 
-            // Layer 3: Leftmost Floating Hover-Expand Liquid Glass Navigation Rail
-            floatingLiquidGlassRail
-                .padding(.leading, 12)
-                .padding(.top, 10)
-                .padding(.bottom, 16)
-                .zIndex(20)
+                // Layer 3: Leftmost Floating Hover-Expand Liquid Glass Navigation Rail
+                floatingLiquidGlassRail
+                    .padding(.leading, 12)
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
+                    .zIndex(20)
+            }
         }
         .frame(minWidth: 860, minHeight: 540)
         .navigationTitle(state.selection.rawValue)
         .toolbarBackground(.hidden, for: .windowToolbar)
-        .inspector(isPresented: $state.inspectorPresented) {
-            InspectorView(
-                model: model,
-                selection: state.selection,
-                pickedDecision: $state.pickedDecision
-            )
-            .inspectorColumnWidth(min: 280, ideal: 340, max: 460)
-        }
         .toolbar {
             toolbarContent
         }
         .background {
-            Button("") { focusMemorySearch() }
-                .keyboardShortcut("f", modifiers: .command)
-                .hidden()
+            ZStack {
+                Button("") { focusMemorySearch() }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .hidden()
+
+                WindowVisibilityObserver { isActive in
+                    if state.isWindowRenderingActive != isActive {
+                        state.isWindowRenderingActive = isActive
+                    }
+                }
+                .allowsHitTesting(false)
+            }
         }
         .overlay(alignment: .bottom) {
             if let toast = model.copyToast {
@@ -123,20 +192,32 @@ struct MainShellView: View {
         .onChange(of: state.selection) { _, selection in
             if selection != .dream {
                 state.pickedDecision = nil
+                state.focusDreamProposals = false
+            }
+            if selection != .activity {
+                state.pendingActivityFilter = nil
             }
             if selection != .memory {
-                state.filterDormantOnly = false
+                state.memoryReviewMode = .standard
             }
             // Auto-collapse right inspector on tab switch unless triggered by a pending inspect-memory jump.
             if state.pendingInspectMemoryID == nil {
                 state.inspectorPresented = false
             }
-            if selection == .memory {
-                if state.memoryDisplayMode == .galaxy {
-                    model.refreshMemoryGraph()
-                } else {
-                    model.find()
-                }
+            if selection == .memory && state.memoryDisplayMode == .galaxy {
+                model.refreshMemoryGraph()
+            }
+        }
+        .onChange(of: state.memoryDisplayMode) { previousMode, mode in
+            if previousMode == .archived || mode == .archived {
+                state.inspectorPresented = false
+            }
+            if mode == .galaxy { model.refreshMemoryGraph() }
+        }
+        .onChange(of: model.selectedMemory?.id) { previousID, currentID in
+            if state.selection == .memory, state.memoryDisplayMode == .archived,
+               previousID != nil, currentID == nil {
+                clearSelection()
             }
         }
         .onChange(of: state.showBackfill) { _, isShown in
@@ -147,6 +228,16 @@ struct MainShellView: View {
         .onChange(of: state.pendingUndo) { _, batchID in
             if batchID != nil {
                 state.inspectorPresented = false
+            }
+        }
+        .onChange(of: state.inspectorPresented) { _, isPresented in
+            if !isPresented {
+                model.selectedMemory = nil
+                state.pickedDecision = nil
+                state.isHoveringInspectorResize = false
+                state.isDraggingInspectorResize = false
+                state.inspectorDragStartWidth = nil
+                state.updateResizeCursor()
             }
         }
         .onChange(of: model.hits.map(\.id)) { _, _ in
@@ -204,10 +295,20 @@ struct MainShellView: View {
                 model: model,
                 selection: $state.selection,
                 isSidebarExpanded: state.sidebarExpanded,
+                isAnimationsPaused: !state.isWindowRenderingActive,
                 onSearchMemory: { query in searchFromOverview(query) },
                 onInspectMemoryID: { memoryID in inspectMemory(id: memoryID) },
                 onOpenAgentSettings: { agent in openAgentSettings(agent) },
-                onInspectDormantMemories: { inspectDormantMemories() },
+                onReviewMemories: { mode in openMemoryReview(mode) },
+                onOpenArchivedMemories: { openArchivedMemories() },
+                onOpenRecallActivity: {
+                    state.pendingActivityFilter = .recall
+                    state.selection = .activity
+                },
+                onOpenDreamProposals: {
+                    state.focusDreamProposals = true
+                    state.selection = .dream
+                },
                 onOpenGalaxy: { openMemoryGalaxy() },
                 onTriggerDreamResonance: { state.dreamResonanceTrigger = Date() },
                 onNonDetailAction: { state.inspectorPresented = false }
@@ -221,7 +322,7 @@ struct MainShellView: View {
                     SegmentedPillBar(
                         options: MemoryDisplayMode.allCases,
                         selection: $state.memoryDisplayMode,
-                        label: { $0.rawValue },
+                        label: { $0.label(archivedCount: model.healthSummary.archivedCount) },
                         icon: { $0.icon },
                         compact: true
                     )
@@ -243,17 +344,60 @@ struct MainShellView: View {
                 .padding(.top, 6)
                 .padding(.bottom, 16)
                 .rotation3DEffect(
-                    .degrees(state.sidebarExpanded ? -12 : 0),
+                    .degrees(state.sidebarExpanded ? -7 : 0),
                     axis: (x: 0, y: 1, z: 0),
                     anchor: .trailing,
                     perspective: 0.45
                 )
-                .offset(x: state.sidebarExpanded ? 72 : 0)
-                .scaleEffect(state.sidebarExpanded ? 0.93 : 1.0, anchor: .trailing)
-                .opacity(state.sidebarExpanded ? 0.64 : 1.0)
-                .blur(radius: state.sidebarExpanded ? 0.8 : 0)
-                .animation(.spring(response: 0.36, dampingFraction: 0.78), value: state.sidebarExpanded)
+                .offset(x: state.sidebarExpanded ? 16 : 0)
+                .scaleEffect(state.sidebarExpanded ? 0.95 : 1.0, anchor: .trailing)
+                .animation(
+                    state.sidebarExpanded
+                        ? .spring(response: 0.32, dampingFraction: 0.82)
+                        : .easeOut(duration: 0.22),
+                    value: state.sidebarExpanded
+                )
         }
+    }
+
+    private func inspectorResizeHandle(windowWidth: CGFloat, currentWidth: CGFloat) -> some View {
+        let active = state.isHoveringInspectorResize || state.isDraggingInspectorResize
+        return ZStack {
+            Capsule()
+                .fill(active ? theme.accent.opacity(theme.isDark ? 0.78 : 0.68) : theme.hairlineBorder.opacity(0.65))
+                .frame(width: active ? 3.5 : 2.5, height: active ? 56 : 34)
+                .shadow(color: active ? theme.accent.opacity(0.45) : .clear, radius: 5)
+                .animation(.easeOut(duration: 0.14), value: active)
+        }
+        .frame(width: 8)
+        .frame(maxHeight: .infinity)
+        .padding(.top, 6)
+        .padding(.bottom, 16)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            state.isHoveringInspectorResize = hovering
+            state.updateResizeCursor()
+        }
+        .gesture(
+            DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { value in
+                    if state.inspectorDragStartWidth == nil {
+                        state.inspectorDragStartWidth = currentWidth
+                        state.isDraggingInspectorResize = true
+                        state.updateResizeCursor()
+                    }
+                    let proposed = (state.inspectorDragStartWidth ?? currentWidth) - value.translation.width
+                    let maxAllowed = max(480, windowWidth * 0.65)
+                    let narrowGuard = max(300, windowWidth - 280)
+                    state.inspectorWidth = min(min(max(proposed, 320), maxAllowed), narrowGuard)
+                }
+                .onEnded { _ in
+                    state.inspectorDragStartWidth = nil
+                    state.isDraggingInspectorResize = false
+                    state.updateResizeCursor()
+                }
+        )
+        .help("拖动调整详情抽屉宽度")
     }
 
     @ViewBuilder
@@ -265,7 +409,7 @@ struct MainShellView: View {
             MemoryListView(
                 model: model,
                 searchFocused: $searchFocused,
-                filterDormantOnly: $state.filterDormantOnly,
+                reviewMode: $state.memoryReviewMode,
                 displayMode: $state.memoryDisplayMode,
                 onSelectMemory: { hit in
                     model.show(hit)
@@ -279,14 +423,15 @@ struct MainShellView: View {
             DreamView(
                 model: model,
                 pickedDecision: $state.pickedDecision,
-                pendingUndo: $state.pendingUndo
+                pendingUndo: $state.pendingUndo,
+                focusProposals: $state.focusDreamProposals
             ) { decision in
                 state.pickedDecision = decision
                 model.show(decision)
                 state.inspectorPresented = true
             }
         case .activity:
-            ActivityView(model: model) { memoryID in
+            ActivityView(model: model, pendingFilter: $state.pendingActivityFilter) { memoryID in
                 inspectMemory(id: memoryID)
             }
         case .settings:
@@ -307,6 +452,7 @@ struct MainShellView: View {
         return VStack(alignment: .leading, spacing: 6) {
             ForEach(AppPage.allCases) { page in
                 let isSelected = state.selection == page
+                let isHovered = state.hoveredPage == page
                 let badge = page.badgeCount(in: model)
                 Button {
                     withAnimation(.spring(response: 0.32, dampingFraction: 0.80)) {
@@ -317,7 +463,7 @@ struct MainShellView: View {
                         ZStack(alignment: .topTrailing) {
                             Image(systemName: page.icon)
                                 .font(.system(size: 15, weight: isSelected ? .semibold : .medium))
-                                .foregroundStyle(isSelected ? theme.accent : theme.textSecondary)
+                                .foregroundStyle(isSelected ? theme.accent : (isHovered ? theme.textPrimary : theme.textSecondary))
                                 .frame(width: 24, height: 24)
 
                             if !expanded && badge > 0 {
@@ -331,8 +477,8 @@ struct MainShellView: View {
 
                         if expanded {
                             Text(page.rawValue)
-                                .font(.callout.weight(isSelected ? .semibold : .medium))
-                                .foregroundStyle(isSelected ? theme.textPrimary : theme.textSecondary)
+                                .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                                .foregroundStyle(isSelected ? theme.textPrimary : (isHovered ? theme.textPrimary : theme.textSecondary))
                                 .lineLimit(1)
                                 .transition(.opacity.combined(with: .move(edge: .leading)))
 
@@ -340,10 +486,10 @@ struct MainShellView: View {
 
                             if badge > 0 {
                                 Text("\(badge)")
-                                    .font(.caption2.weight(.semibold))
+                                    .font(.system(size: 11.5, weight: .semibold))
                                     .monospacedDigit()
                                     .foregroundStyle(theme.warning)
-                                    .padding(.horizontal, 6)
+                                    .padding(.horizontal, 6.5)
                                     .padding(.vertical, 2)
                                     .background(theme.warningSoft, in: Capsule())
                                     .transition(.opacity)
@@ -355,14 +501,43 @@ struct MainShellView: View {
                     .frame(maxWidth: .infinity, alignment: expanded ? .leading : .center)
                     .background(
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .fill(isSelected ? theme.accentSoft : Color.clear)
+                            .fill(
+                                isSelected
+                                    ? theme.accentSoft
+                                    : (isHovered
+                                        ? (theme.isDark ? Color.white.opacity(0.09) : Color.white.opacity(0.62))
+                                        : Color.clear)
+                            )
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .stroke(isSelected ? theme.accent.opacity(theme.isDark ? 0.36 : 0.28) : Color.clear, lineWidth: 1)
+                            .stroke(
+                                isSelected
+                                    ? theme.accent.opacity(theme.isDark ? 0.42 : 0.34)
+                                    : (isHovered
+                                        ? (theme.isDark ? Color.white.opacity(0.24) : Color.white.opacity(0.88))
+                                        : Color.clear),
+                                lineWidth: isSelected ? 1.15 : 1.0
+                            )
                     )
+                    .shadow(
+                        color: isHovered && !isSelected
+                            ? (theme.isDark ? Color.black.opacity(0.18) : Color.black.opacity(0.06))
+                            : .clear,
+                        radius: 6,
+                        y: 2
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .animation(.easeOut(duration: 0.14), value: isHovered)
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering {
+                        state.hoveredPage = page
+                    } else if state.hoveredPage == page {
+                        state.hoveredPage = nil
+                    }
+                }
                 .help(page.rawValue)
             }
 
@@ -390,7 +565,7 @@ struct MainShellView: View {
 
                     if expanded {
                         Text(runtime.title)
-                            .font(.caption.weight(.semibold))
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(theme.textPrimary)
                             .lineLimit(1)
                             .transition(.opacity)
@@ -424,9 +599,9 @@ struct MainShellView: View {
         HStack(spacing: 4) {
             Circle()
                 .fill(active ? brand.color(in: theme) : theme.textTertiary.opacity(0.45))
-                .frame(width: 5.5, height: 5.5)
+                .frame(width: 6, height: 6)
             Text(brand.rawValue)
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(active ? theme.textSecondary : theme.textTertiary)
                 .lineLimit(1)
         }
@@ -493,7 +668,10 @@ struct MainShellView: View {
 
     private func focusMemorySearch() {
         state.pendingInspectMemoryID = nil
-        state.memoryDisplayMode = .list
+        if state.selection != .memory || state.memoryDisplayMode != .archived {
+            state.memoryDisplayMode = .list
+            state.memoryReviewMode = .standard
+        }
         state.inspectorPresented = false
         state.selection = .memory
         DispatchQueue.main.async {
@@ -504,7 +682,7 @@ struct MainShellView: View {
     private func searchFromOverview(_ query: String) {
         state.pendingInspectMemoryID = nil
         state.memoryDisplayMode = .list
-        state.filterDormantOnly = false
+        state.memoryReviewMode = .standard
         model.query = query
         state.inspectorPresented = false
         state.selection = .memory
@@ -520,23 +698,42 @@ struct MainShellView: View {
         state.selection = .settings
     }
 
-    private func inspectDormantMemories() {
+    private func openMemoryReview(_ mode: MemoryReviewMode) {
         state.pendingInspectMemoryID = nil
         state.memoryDisplayMode = .list
         model.query = ""
         model.projectFilter = false
-        state.filterDormantOnly = true
+        state.memoryReviewMode = mode
+        state.inspectorPresented = false
+        state.selection = .memory
+        if mode == .leastUsed { model.refreshMemoryGraph() }
+    }
+
+    private func openArchivedMemories() {
+        state.pendingInspectMemoryID = nil
+        state.memoryReviewMode = .standard
+        state.memoryDisplayMode = .archived
         state.inspectorPresented = false
         state.selection = .memory
     }
 
     private func openMemoryGalaxy() {
         state.pendingInspectMemoryID = nil
-        state.filterDormantOnly = false
+        state.memoryReviewMode = .standard
         state.memoryDisplayMode = .galaxy
         state.inspectorPresented = false
         state.selection = .memory
         model.refreshMemoryGraph()
+    }
+
+    private func clearSelection() {
+        model.selectedMemory = nil
+        state.pickedDecision = nil
+        if state.inspectorPresented {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                state.inspectorPresented = false
+            }
+        }
     }
 
     private func inspectMemory(id memoryID: String) {
@@ -556,5 +753,94 @@ struct MainShellView: View {
         model.projectFilter = false
         model.find()
         state.inspectorPresented = true
+    }
+}
+
+// MARK: - Window Foreground / Occlusion Visibility Observer
+
+private struct WindowVisibilityObserver: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    final class ObserverHostView: NSView {
+        var onChange: ((Bool) -> Void)?
+        private var observers: [NSObjectProtocol] = []
+        private var lastReported: Bool?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            attachObservers(for: window)
+        }
+
+        func attachObservers(for window: NSWindow?) {
+            detachObservers()
+            guard let window else { return }
+
+            let center = NotificationCenter.default
+            let handler: @Sendable (Notification) -> Void = { [weak self] _ in
+                Task { @MainActor in
+                    self?.evaluateVisibility()
+                }
+            }
+
+            let appNotifications: [Notification.Name] = [
+                NSApplication.didResignActiveNotification,
+                NSApplication.didBecomeActiveNotification,
+                NSApplication.didHideNotification,
+                NSApplication.didUnhideNotification
+            ]
+            for name in appNotifications {
+                observers.append(center.addObserver(forName: name, object: NSApp, queue: .main, using: handler))
+            }
+
+            let windowNotifications: [Notification.Name] = [
+                NSWindow.didChangeOcclusionStateNotification,
+                NSWindow.didMiniaturizeNotification,
+                NSWindow.didDeminiaturizeNotification
+            ]
+            for name in windowNotifications {
+                observers.append(center.addObserver(forName: name, object: window, queue: .main, using: handler))
+            }
+
+            evaluateVisibility()
+        }
+
+        func detachObservers() {
+            let center = NotificationCenter.default
+            for token in observers {
+                center.removeObserver(token)
+            }
+            observers.removeAll()
+        }
+
+        @MainActor
+        func evaluateVisibility() {
+            guard let window else { return }
+            let isActive = NSApp.isActive
+                && !NSApp.isHidden
+                && !window.isMiniaturized
+                && window.occlusionState.contains(.visible)
+            if lastReported != isActive {
+                lastReported = isActive
+                onChange?(isActive)
+            }
+        }
+
+        deinit {
+            detachObservers()
+        }
+    }
+
+    func makeNSView(context: Context) -> ObserverHostView {
+        let view = ObserverHostView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: ObserverHostView, context: Context) {
+        nsView.onChange = onChange
+    }
+
+    static func dismantleNSView(_ nsView: ObserverHostView, coordinator: ()) {
+        nsView.detachObservers()
     }
 }

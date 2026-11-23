@@ -107,6 +107,12 @@ public final class MemoryStore: @unchecked Sendable {
                 CREATE INDEX history_batch ON history(batch_id);
                 """)
         }
+        migrator.registerMigration("archived_memory_deletion") { db in
+            try db.execute(sql: """
+                ALTER TABLE batch ADD COLUMN has_deleted_memory INTEGER NOT NULL DEFAULT 0;
+                CREATE INDEX memory_archive_recent ON memory(updated DESC, id) WHERE archived = 1;
+                """)
+        }
         try migrator.migrate(database)
     }
 
@@ -222,7 +228,8 @@ public final class MemoryStore: @unchecked Sendable {
                 let ids = selected.map(\.id)
                 try Self.recordHits(db, ids: ids)
                 let event = try Self.insertActivity(db, .recall, agent: agent, project: project,
-                                                    memoryIDs: ids, count: ids.count, estimatedTokens: tokens)
+                                                    memoryIDs: ids, count: ids.count, estimatedTokens: tokens,
+                                                    message: context)
                 // A failed socket write rolls back both the hit counters and the activity.
                 try deliver(context)
                 return event
@@ -403,6 +410,102 @@ public final class MemoryStore: @unchecked Sendable {
         }
     }
 
+    public func projectSummaries() throws -> [ProjectSummary] {
+        try database.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT project, SUM(active) AS active, SUM(archived) AS archived,
+                       SUM(queued) AS queued, SUM(claimed) AS claimed
+                FROM (
+                    SELECT project, COUNT(*) FILTER (WHERE archived = 0) AS active,
+                           COUNT(*) FILTER (WHERE archived = 1) AS archived, 0 AS queued, 0 AS claimed
+                    FROM memory WHERE project <> '' GROUP BY project
+                    UNION ALL
+                    SELECT project, 0, 0, COUNT(*) FILTER (WHERE state = 'queued'),
+                           COUNT(*) FILTER (WHERE state = 'claimed')
+                    FROM evidence WHERE project <> '' GROUP BY project
+                )
+                GROUP BY project
+                ORDER BY SUM(active + archived + queued + claimed) DESC, project
+                """).map { row in
+                    ProjectSummary(project: row["project"], activeMemoryCount: row["active"],
+                                   archivedMemoryCount: row["archived"], queuedEvidenceCount: row["queued"],
+                                   claimedEvidenceCount: row["claimed"])
+                }
+        }
+    }
+
+    public func previewProjectMigration(from: String, to: String) throws -> ProjectMigrationPreview {
+        let (source, target) = try Self.migrationProjects(from: from, to: to)
+        return try database.read { db in
+            let memories = try Row.fetchOne(db, sql: """
+                SELECT COUNT(*) FILTER (WHERE archived = 0) AS active,
+                       COUNT(*) FILTER (WHERE archived = 1) AS archived
+                FROM memory WHERE project = ?
+                """, arguments: [source])
+            let evidence = try Row.fetchOne(db, sql: """
+                SELECT COUNT(*) FILTER (WHERE state = 'queued') AS queued,
+                       COUNT(*) FILTER (WHERE state = 'done') AS done,
+                       COUNT(*) FILTER (WHERE state = 'claimed') AS claimed
+                FROM evidence WHERE project = ?
+                """, arguments: [source])
+            return ProjectMigrationPreview(fromProject: source, toProject: target,
+                                           activeMemoryCount: memories?["active"] ?? 0,
+                                           archivedMemoryCount: memories?["archived"] ?? 0,
+                                           queuedEvidenceCount: evidence?["queued"] ?? 0,
+                                           doneEvidenceCount: evidence?["done"] ?? 0,
+                                           claimedEvidenceCount: evidence?["claimed"] ?? 0)
+        }
+    }
+
+    public func migrateProject(from: String, to: String) throws -> ProjectMigrationResult {
+        let (source, target) = try Self.migrationProjects(from: from, to: to)
+        let result = try database.write { db in
+            try Self.releaseExpired(db, project: source)
+            let claimed = try Bool.fetchOne(db, sql: """
+                SELECT EXISTS(SELECT 1 FROM evidence WHERE project = ? AND state = 'claimed')
+                """, arguments: [source]) ?? false
+            guard !claimed else {
+                throw MemoryError.invalid("源项目存在进行中的做梦批次，请先提交或调用 dream_release_batch 退回后再迁移。")
+            }
+            try db.execute(sql: """
+                UPDATE memory SET project = ?, payload = CAST(json_set(CAST(payload AS TEXT), '$.project', ?) AS BLOB)
+                WHERE project = ?
+                """, arguments: [target, target, source])
+            let memoryCount = db.changesCount
+            try db.execute(sql: """
+                UPDATE evidence SET project = ?, payload = CAST(json_set(CAST(payload AS TEXT), '$.project', ?) AS BLOB)
+                WHERE project = ?
+                """, arguments: [target, target, source])
+            let evidenceCount = db.changesCount
+            let count = memoryCount + evidenceCount
+            if count > 0 {
+                try db.execute(sql: "UPDATE vector_revision SET revision = revision + 1")
+                let detail = "记忆 \(memoryCount) 条，证据 \(evidenceCount) 条"
+                let message = SecretFilter.contains(source) || SecretFilter.contains(target)
+                    ? "迁移项目（\(detail)）"
+                    : "从 \(source) 迁移到 \(target)（\(detail)）"
+                // The activity view already displays the message for local data operations.
+                try Self.insertActivity(db, .scan, project: target, count: count, message: message)
+            }
+            return ProjectMigrationResult(fromProject: source, toProject: target,
+                                          migratedMemoryCount: memoryCount, migratedEvidenceCount: evidenceCount)
+        }
+        if result.migratedMemoryCount + result.migratedEvidenceCount > 0 {
+            invalidateDuplicatePairs()
+        }
+        return result
+    }
+
+    private static func migrationProjects(from: String, to: String) throws -> (String, String) {
+        guard from.hasPrefix("/"), to.hasPrefix("/"), !from.contains("\0"), !to.contains("\0") else {
+            throw MemoryError.invalid("源项目和目标项目都需要有效的绝对路径。")
+        }
+        let source = ProjectIdentity.resolve(from)
+        let target = ProjectIdentity.resolve(to)
+        guard source != target else { throw MemoryError.invalid("源项目和目标项目必须是不同的路径。") }
+        return (source, target)
+    }
+
     /// Recent submitted batches, including those that were rolled back.
     public func dreamBatchSummaries() throws -> [DreamBatchSummary] {
         try database.read { try Self.dreamBatchSummaries($0) }
@@ -414,7 +517,7 @@ public final class MemoryStore: @unchecked Sendable {
                    (SELECT COUNT(*) FROM decision WHERE batch_id = b.id AND status = 'applied') AS applied,
                    (SELECT COUNT(*) FROM decision WHERE batch_id = b.id AND status = 'review') AS pending,
                    (SELECT COUNT(*) FROM decision WHERE batch_id = b.id AND status = 'conflict') AS conflicts,
-                   b.reversed = 0 AND NOT EXISTS (
+                   b.reversed = 0 AND b.has_deleted_memory = 0 AND NOT EXISTS (
                        SELECT 1 FROM history h LEFT JOIN memory m ON m.id = h.memory_id
                        WHERE h.batch_id = b.id AND (
                            m.id IS NULL OR m.content_version <> json_extract(CAST(h.current AS TEXT), '$.version')
@@ -774,6 +877,10 @@ public final class MemoryStore: @unchecked Sendable {
         return result
     }
 
+    private func invalidateDuplicatePairs() {
+        duplicatePairsLock.withLock { duplicatePairsCache = nil }
+    }
+
     @discardableResult
     public func repairVectors() throws -> Bool {
         guard EmbeddingRuntime.isInstalled() else { return false }
@@ -808,27 +915,53 @@ public final class MemoryStore: @unchecked Sendable {
         }
     }
 
-    private static func releaseExpired(_ db: Database) throws {
+    @discardableResult
+    private static func releaseExpired(_ db: Database, batchID: String? = nil, project: String? = nil) throws -> Int {
+        let now = Date().timeIntervalSince1970
+        let batchFilter = batchID == nil ? "" : " AND b.id = ?"
+        let projectFilter = project == nil ? "" : " AND project = ?"
+        var arguments: StatementArguments = []
+        if let project { arguments += [project] }
+        arguments += [now]
+        if let batchID { arguments += [batchID] }
+        arguments += [now]
         try db.execute(sql: """
-            UPDATE evidence SET state = 'queued' WHERE state = 'claimed' AND id IN (
+            UPDATE evidence SET state = 'queued' WHERE state = 'claimed'\(projectFilter) AND id IN (
               SELECT be.evidence_id FROM batch_evidence be JOIN batch b ON b.id = be.batch_id
-              WHERE b.expires < ? AND b.response IS NULL
+              WHERE b.expires < ? AND b.response IS NULL\(batchFilter)
             ) AND id NOT IN (
               SELECT be.evidence_id FROM batch_evidence be JOIN batch b ON b.id = be.batch_id
               WHERE b.expires >= ? AND b.response IS NULL
             )
-            """, arguments: [Date().timeIntervalSince1970, Date().timeIntervalSince1970])
+            """, arguments: arguments)
+        return db.changesCount
     }
 
-    func releaseUndeliveredBatch(_ id: String) throws {
+    func releaseBatch(_ id: String) throws -> Int {
         try database.write { db in
-            try db.execute(sql: "UPDATE batch SET expires = 0 WHERE id = ? AND response IS NULL", arguments: [id])
-            try Self.releaseExpired(db)
+            guard let submitted = try Bool.fetchOne(db, sql: "SELECT response IS NOT NULL FROM batch WHERE id = ?",
+                                                    arguments: [id]) else {
+                throw MemoryError.invalid("找不到做梦批次。")
+            }
+            guard !submitted else { throw MemoryError.invalid("批次已提交，无法退回队列。") }
+            try db.execute(sql: "UPDATE batch SET expires = 0 WHERE id = ?", arguments: [id])
+            return try Self.releaseExpired(db, batchID: id)
         }
+    }
+
+    enum DreamClaim {
+        case batch(DreamBatch)
+        case empty(claimedCount: Int)
     }
 
     public func getBatch(project: String? = nil, limit: Int = 4, batchID: String? = nil,
                          through: Int64? = nil) throws -> DreamBatch? {
+        guard case let .batch(batch) = try claimBatch(project: project, limit: limit, batchID: batchID,
+                                                      through: through) else { return nil }
+        return batch
+    }
+
+    func claimBatch(project: String?, limit: Int, batchID: String?, through: Int64?) throws -> DreamClaim {
         try database.write { db in
             try Self.releaseExpired(db)
             if let batchID {
@@ -845,24 +978,29 @@ public final class MemoryStore: @unchecked Sendable {
                         throw MemoryError.invalid("批次含已排除来源，请重新领取。")
                     }
                 }
-                return batch
+                return .batch(batch)
             }
             let limit = min(max(1, limit), 8)
-            var sql = "SELECT payload FROM evidence WHERE state = 'queued'"
+            var scope = ""
             var arguments: StatementArguments = []
             if let project {
-                sql += " AND project = ?"
+                scope += " AND project = ?"
                 arguments += [ProjectIdentity.resolve(project)]
             }
             if let through {
-                sql += " AND rowid <= ?"
+                scope += " AND rowid <= ?"
                 arguments += [through]
             }
-            sql += " ORDER BY time, rowid LIMIT ?"
-            arguments += [limit]
-            let payloads = try Data.fetchAll(db, sql: sql, arguments: arguments)
+            let payloads = try Data.fetchAll(db, sql: """
+                SELECT payload FROM evidence WHERE state = 'queued'\(scope) ORDER BY time, rowid LIMIT ?
+                """, arguments: arguments + [limit])
+            guard !payloads.isEmpty else {
+                let claimedCount = try Int.fetchOne(db, sql: """
+                    SELECT COUNT(*) FROM evidence WHERE state = 'claimed'\(scope)
+                    """, arguments: arguments) ?? 0
+                return .empty(claimedCount: claimedCount)
+            }
             let evidence = try payloads.map { try Wire.decode(Evidence.self, $0) }
-            guard !evidence.isEmpty else { return nil }
             var related: [Memory] = []
             var seen: Set<String> = []
             for item in evidence {
@@ -880,7 +1018,7 @@ public final class MemoryStore: @unchecked Sendable {
             }
             try Self.insertActivity(db, .dreamClaim, project: project.map(ProjectIdentity.resolve),
                                     count: evidence.count, batchID: batch.id)
-            return batch
+            return .batch(batch)
         }
     }
 
@@ -899,14 +1037,19 @@ public final class MemoryStore: @unchecked Sendable {
             let batch = try Wire.decode(DreamBatch.self, row["payload"])
             guard !proposals.isEmpty, proposals.count <= 24 else { throw MemoryError.invalid("请提交 1–24 条提案。") }
             var targets: Set<String> = []
-            var covered: Set<String> = []
+            for (index, proposal) in proposals.enumerated() {
+                do {
+                    try Self.validate(proposal, batch: batch, db: db)
+                    if let target = proposal.memoryID, !targets.insert(target).inserted {
+                        throw MemoryError.invalid("同一批次只能对同一条记忆提交一项变更。")
+                    }
+                } catch MemoryError.invalid(let message) {
+                    throw MemoryError.invalid("第 \(index + 1) 条提案：\(message)")
+                }
+            }
+            let covered = Set(proposals.flatMap(\.evidenceIDs))
             var decisions: [Decision] = []
             for proposal in proposals {
-                try Self.validate(proposal, batch: batch, db: db)
-                if let target = proposal.memoryID, !targets.insert(target).inserted {
-                    throw MemoryError.invalid("同一批次只能对同一条记忆提交一项变更。")
-                }
-                covered.formUnion(proposal.evidenceIDs)
                 let status = try status(proposal, db: db)
                 let decision = Decision(id: UUID().uuidString, batchID: batchID, proposal: proposal,
                                         status: status.0, message: status.1)
@@ -935,10 +1078,13 @@ public final class MemoryStore: @unchecked Sendable {
               !proposal.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               proposal.reason.count <= 800 else { throw MemoryError.invalid("每项提案需要证据和简短理由。") }
         let valid = Dictionary(uniqueKeysWithValues: batch.evidence.map { ($0.id, $0) })
-        for id in proposal.evidenceIDs {
-            guard valid[id] != nil, try String.fetchOne(db, sql: "SELECT state FROM evidence WHERE id = ?",
-                                                        arguments: [id]) == "claimed" else {
-                throw MemoryError.invalid("证据不属于当前批次，或来源已排除。")
+        for (index, id) in proposal.evidenceIDs.enumerated() {
+            guard valid[id] != nil else {
+                throw MemoryError.invalid("evidenceIDs 第 \(index + 1) 项不属于当前批次，请使用本批 evidence 中的 ID。")
+            }
+            guard try String.fetchOne(db, sql: "SELECT state FROM evidence WHERE id = ?",
+                                      arguments: [id]) == "claimed" else {
+                throw MemoryError.invalid("evidenceIDs 第 \(index + 1) 项已被排除或不再处于领取状态，请重新领取。")
             }
         }
         let content = [proposal.title, proposal.body, proposal.project, proposal.reason].compactMap { $0 }.joined(separator: "\n")
@@ -1018,6 +1164,106 @@ public final class MemoryStore: @unchecked Sendable {
         }
     }
 
+    public func memories(ids: [String]) throws -> [Memory] {
+        guard !ids.isEmpty else { return [] }
+        let requested = String(decoding: try Wire.data(ids), as: UTF8.self)
+        return try database.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT m.payload, m.hit_count, m.last_hit_at
+                FROM json_each(?) AS requested JOIN memory AS m ON m.id = requested.value
+                ORDER BY requested.key
+                """, arguments: [requested]).map(Self.memory)
+        }
+    }
+
+    public func archivedMemories(query: String = "", limit: Int = 200) throws -> [Memory] {
+        guard limit > 0 else { return [] }
+        return try database.read { db in
+            let rows = try Row.fetchCursor(db, sql: """
+                SELECT payload, hit_count, last_hit_at FROM memory WHERE archived = 1 ORDER BY updated DESC, id
+                """)
+            var matches: [Memory] = []
+            while matches.count < limit, let row = try rows.next() {
+                let memory = try Self.memory(row)
+                if query.isEmpty || memory.title.range(of: query, options: .caseInsensitive) != nil ||
+                    memory.body.range(of: query, options: .caseInsensitive) != nil {
+                    matches.append(memory)
+                }
+            }
+            return matches
+        }
+    }
+
+    public func deleteArchivedMemory(id: String) throws {
+        _ = try deleteArchivedMemories(id: id)
+    }
+
+    public func deleteAllArchivedMemories() throws -> Int {
+        try deleteArchivedMemories(id: nil)
+    }
+
+    private func deleteArchivedMemories(id: String?) throws -> Int {
+        let count = try database.write { db in
+            let predicate = id == nil ? "archived = 1" : "archived = 1 AND id = ?"
+            let arguments: StatementArguments = id.map { [$0] } ?? []
+            let ids = "SELECT id FROM memory WHERE \(predicate)"
+            let exists = try Bool.fetchOne(db, sql: "SELECT EXISTS(\(ids))", arguments: arguments) ?? false
+            guard exists else {
+                if id != nil { throw MemoryError.invalid("仅支持永久删除已归档记忆，请先归档。") }
+                return 0
+            }
+            // Once a history row is gone, that batch can no longer be rolled back in full.
+            try db.execute(sql: """
+                UPDATE batch SET has_deleted_memory = 1 WHERE has_deleted_memory = 0 AND id IN (
+                    SELECT batch_id FROM history WHERE memory_id IN (\(ids))
+                )
+                """, arguments: arguments)
+            try db.execute(sql: "DELETE FROM memory_fts WHERE id IN (\(ids))", arguments: arguments)
+            try db.execute(sql: "DELETE FROM history WHERE memory_id IN (\(ids))", arguments: arguments)
+            try db.execute(sql: "DELETE FROM memory WHERE \(predicate)", arguments: arguments)
+            let count = db.changesCount
+            try Self.insertActivity(db, .scan, memoryIDs: id.map { [$0] } ?? [], count: count,
+                                    message: id == nil ? "已永久清空 \(count) 条归档记忆" : "已永久删除归档记忆")
+            return count
+        }
+        if count > 0 { invalidateDuplicatePairs() }
+        return count
+    }
+
+    public func setMemoryArchived(id: String, archived: Bool) throws -> Memory {
+        try database.write { db in
+            guard let previous = try Self.current(db, id) else { throw MemoryError.invalid("记忆不存在。") }
+            guard previous.archived != archived else { return previous }
+            return try Self.setArchived(db, memory: previous, archived: archived, batchID: "manual-\(UUID().uuidString)")
+        }
+    }
+
+    public func archiveMemories(ids: [String]) throws -> Int {
+        guard !ids.isEmpty else { return 0 }
+        let batchID = "manual-\(UUID().uuidString)"
+        let count = try database.write { db in
+            var count = 0
+            for id in Set(ids).sorted() {
+                guard let memory = try Self.current(db, id), !memory.archived else { continue }
+                _ = try Self.setArchived(db, memory: memory, archived: true, batchID: batchID)
+                count += 1
+            }
+            return count
+        }
+        if count > 0 { invalidateDuplicatePairs() }
+        return count
+    }
+
+    private static func setArchived(_ db: Database, memory previous: Memory, archived: Bool, batchID: String) throws -> Memory {
+        var memory = Memory(id: previous.id, version: previous.version + 1,
+                            title: previous.title, body: previous.body, project: previous.project,
+                            archived: archived, evidenceIDs: previous.evidenceIDs, updated: Date().timeIntervalSince1970)
+        memory.hitCount = previous.hitCount
+        memory.lastHitAt = previous.lastHitAt
+        try save(db, memory: memory, previous: previous, batchID: batchID, reuseVectors: true)
+        return memory
+    }
+
     private static func memory(_ row: Row) throws -> Memory {
         var memory = try Wire.decode(Memory.self, row["payload"])
         memory.hitCount = row["hit_count"]
@@ -1030,7 +1276,8 @@ public final class MemoryStore: @unchecked Sendable {
                          arguments: [id]).map(memory)
     }
 
-    private static func apply(_ proposal: Proposal, batchID: String, db: Database) throws {
+    private static func apply(_ proposal: Proposal, batchID: String, db: Database,
+                              projectOverride: String? = nil) throws {
         let previous = try proposal.memoryID.flatMap { try current(db, $0) }
         if let target = proposal.memoryID {
             guard let previous, previous.id == target, previous.version == proposal.expectedVersion, !previous.archived else {
@@ -1042,15 +1289,24 @@ public final class MemoryStore: @unchecked Sendable {
         let memory = Memory(id: previous?.id ?? UUID().uuidString, version: (previous?.version ?? 0) + 1,
                             title: isArchive ? (previous?.title ?? "") : (proposal.title ?? ""),
                             body: isArchive ? (previous?.body ?? "") : (proposal.body ?? ""),
-                            project: isArchive ? previous?.project : proposal.project,
+                            project: isArchive ? previous?.project : (projectOverride ?? proposal.project),
                             archived: isArchive, evidenceIDs: ids, updated: Date().timeIntervalSince1970)
         try save(db, memory: memory, previous: previous, batchID: batchID)
     }
 
-    private static func save(_ db: Database, memory: Memory, previous: Memory?, batchID: String) throws {
-        let vectors = memory.archived ? [] : Retrieval.vectors(memory.title + "\n" + memory.body)
+    private static func save(_ db: Database, memory: Memory, previous: Memory?, batchID: String,
+                             reuseVectors: Bool = false) throws {
+        let previousVectors = reuseVectors
+            ? try Data.fetchOne(db, sql: "SELECT vectors FROM memory WHERE id = ?", arguments: [memory.id])
+            : nil
+        let vectorData: Data?
+        if let previousVectors {
+            vectorData = previousVectors
+        } else {
+            let vectors = memory.archived ? [] : Retrieval.vectors(memory.title + "\n" + memory.body)
+            vectorData = vectors.isEmpty ? nil : try Wire.data(vectors)
+        }
         let encoded = try Wire.data(memory)
-        let vectorData = vectors.isEmpty ? nil : try Wire.data(vectors)
         try db.execute(sql: """
             INSERT INTO memory (id, project, archived, updated, payload, vectors, content_version) VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET project=excluded.project, archived=excluded.archived, updated=excluded.updated,
@@ -1073,7 +1329,15 @@ public final class MemoryStore: @unchecked Sendable {
             guard try Int.fetchOne(db, sql: "SELECT reversed FROM batch WHERE id = ?", arguments: [decision.batchID]) == 0 else {
                 throw MemoryError.invalid("该批次已撤销。")
             }
-            if accept { try Self.apply(decision.proposal, batchID: decision.batchID, db: db) }
+            if accept {
+                var projectOverride: String?
+                if decision.proposal.scope == "project", let evidenceID = decision.proposal.evidenceIDs.first {
+                    // Project evidence shared one scope at submission. Read its live scope in case it moved.
+                    projectOverride = try String.fetchOne(db, sql: "SELECT project FROM evidence WHERE id = ?",
+                                                          arguments: [evidenceID])
+                }
+                try Self.apply(decision.proposal, batchID: decision.batchID, db: db, projectOverride: projectOverride)
+            }
             try Self.setDecision(db, decision, status: accept ? "applied" : "rejected", message: accept ? "已确认写回。" : "已拒绝。")
         }
     }
@@ -1086,8 +1350,12 @@ public final class MemoryStore: @unchecked Sendable {
 
     public func undo(_ batchID: String) throws {
         try database.write { db in
-            guard try Int.fetchOne(db, sql: "SELECT reversed FROM batch WHERE id = ? AND response IS NOT NULL",
-                                   arguments: [batchID]) == 0 else { throw MemoryError.invalid("找不到可撤销的批次。") }
+            guard let batch = try Row.fetchOne(db, sql: """
+                SELECT has_deleted_memory FROM batch WHERE id = ? AND response IS NOT NULL AND reversed = 0
+                """, arguments: [batchID]) else { throw MemoryError.invalid("找不到可撤销的批次。") }
+            guard !(batch["has_deleted_memory"] as Bool) else {
+                throw MemoryError.invalid("批次中的记忆已被永久删除，未撤销任何条目。")
+            }
             let items = try Row.fetchAll(db, sql: "SELECT * FROM history WHERE batch_id = ? ORDER BY id DESC",
                                          arguments: [batchID]).map(Self.historyItem)
             for item in items {
@@ -1095,8 +1363,9 @@ public final class MemoryStore: @unchecked Sendable {
                     throw MemoryError.invalid("批次中的记忆已被更新，未撤销任何条目。")
                 }
                 let old = item.previous ?? recent
+                let project = recent.project == item.current.project ? old.project : recent.project
                 let reversed = Memory(id: recent.id, version: recent.version + 1, title: old.title, body: old.body,
-                                      project: old.project, archived: item.previous == nil || old.archived,
+                                      project: project, archived: item.previous == nil || old.archived,
                                       evidenceIDs: old.evidenceIDs, updated: Date().timeIntervalSince1970)
                 try Self.save(db, memory: reversed, previous: recent, batchID: "undo-" + batchID)
             }

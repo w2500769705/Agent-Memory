@@ -31,7 +31,7 @@ enum AppThemeMode: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-final class AppModel: ObservableObject {
+public final class AppModel: ObservableObject {
     @Published var dashboard: Dashboard?
     @Published private(set) var recentActivities: [ActivityEvent] = []
     @Published private(set) var todayRecallCount: Int = 0
@@ -39,6 +39,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var runtimeHealth = RuntimeHealth()
     @Published private(set) var healthSummary: MemoryHealthSummary = MemoryHealthSummary()
     @Published private(set) var memoryGraph = MemoryGraph()
+    @Published public private(set) var projectSummaries: [ProjectSummary] = []
+    @Published public private(set) var archivedMemories: [Memory] = []
     @Published private(set) var lastPulseMemoryIDs: [String] = []
     @Published private(set) var lastPulseAgent: ActivityEvent.Agent?
     @Published private(set) var lastPulseAt: Date?
@@ -97,6 +99,19 @@ final class AppModel: ObservableObject {
     private var antigravityScanFailed = false
     private var embeddingState: RuntimeHealth.EmbeddingState = .checking
     private var applicationSocket: URL = MemoryPaths.socket
+    private var archivedMemoryQuery = ""
+
+    public var appVersionSummary: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        guard let version = info["CFBundleShortVersionString"] as? String, !version.isEmpty else {
+            return "v0.4.0-dev"
+        }
+        guard let build = info["CFBundleVersion"] as? String, !build.isEmpty else { return "v\(version)" }
+        if let sha = info["AgentMemoryGitSHA"] as? String, !sha.isEmpty {
+            return "v\(version) (build \(build) · \(sha))"
+        }
+        return "v\(version) (build \(build))"
+    }
 
     init() {
         do {
@@ -236,6 +251,9 @@ final class AppModel: ObservableObject {
         defer { updateRuntimeHealth() }
         do {
             dashboard = try store.dashboard()
+            let projects = try store.projectSummaries()
+            if projects != projectSummaries { projectSummaries = projects }
+            archivedMemories = try store.archivedMemories(query: archivedMemoryQuery)
             enabled = try store.setting("enabled") == "1"
             antigravityEnabled = try store.setting(AntigravitySource.enabledKey) == "1"
             recallEnabled = try store.setting("recallEnabled") == "1"
@@ -253,8 +271,12 @@ final class AppModel: ObservableObject {
                     self.selectedMemory = nil
                     evidence = []
                     history = []
-                } else if let current, current.hitCount != selectedMemory.memory.hitCount ||
+                } else if let current, current.project != selectedMemory.memory.project ||
+                            current.hitCount != selectedMemory.memory.hitCount ||
                             current.lastHitAt != selectedMemory.memory.lastHitAt {
+                    if current.project != selectedMemory.memory.project {
+                        evidence = try store.evidence(current.evidenceIDs)
+                    }
                     self.selectedMemory = SearchHit(memory: current, vector: selectedMemory.vector,
                                                     keywordRank: selectedMemory.keywordRank, score: selectedMemory.score)
                 }
@@ -348,6 +370,84 @@ final class AppModel: ObservableObject {
         return try store.memory(id: id, version: version)
     }
 
+    public func memories(ids: [String]) -> [Memory] {
+        (try? store?.memories(ids: ids)) ?? []
+    }
+
+    public func previewProjectMigration(from: String, to: String) throws -> ProjectMigrationPreview {
+        guard let store else { throw MemoryError.invalid("记忆库未就绪。") }
+        return try store.previewProjectMigration(from: from, to: to)
+    }
+
+    @discardableResult
+    public func migrateProject(from: String, to: String) throws -> ProjectMigrationResult {
+        guard let store else { throw MemoryError.invalid("记忆库未就绪。") }
+        let result = try store.migrateProject(from: from, to: to)
+        searchTask?.cancel()
+        searchTask = nil
+        refresh()
+        showCopyToast("已迁移记忆 \(result.migratedMemoryCount) 条，证据 \(result.migratedEvidenceCount) 条")
+        return result
+    }
+
+    public func copyProjectMigrationPrompt(from: String, to: String) {
+        let executable = Bundle.main.url(forAuxiliaryExecutable: "agent-memory-mcp")?.path ?? "agent-memory-mcp"
+        let command = ProjectMigrationCommand.shellCommand(from: from, to: to,
+                                                          executable: executable, socket: applicationSocket)
+        let prompt = """
+            请在当前 Mac 执行下面的 Agent Memory 项目迁移命令。
+            \(command)
+
+            执行完成后汇报迁移统计。若目标项目有待做梦记录，继续调用做梦将其归档。
+            """
+        copyInstruction(prompt, message: "已复制项目迁移指令，粘贴到 Agent 中继续")
+    }
+
+    func archiveMemory(id: String, archived: Bool = true) {
+        act(operation: archived ? "归档记忆失败" : "恢复记忆失败") { store in
+            let memory = try store.setMemoryArchived(id: id, archived: archived)
+            searchTask?.cancel()
+            searchTask = nil
+            if memory.archived { hits.removeAll { $0.id == id } }
+            showCopyToast(memory.archived ? "已归档记忆，可随时恢复" : "已恢复为活跃记忆")
+        }
+    }
+
+    public func refreshArchivedMemories(query: String = "") {
+        archivedMemoryQuery = query
+        guard let store else { return }
+        do {
+            archivedMemories = try store.archivedMemories(query: query)
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    public func deleteArchivedMemory(id: String) {
+        act(operation: "永久删除归档记忆失败") { store in
+            try store.deleteArchivedMemory(id: id)
+            showCopyToast("已永久删除归档记忆")
+        }
+    }
+
+    public func deleteAllArchivedMemories() {
+        act(operation: "清空归档记忆失败") { store in
+            let count = try store.deleteAllArchivedMemories()
+            showCopyToast("已永久清空 \(count) 条归档记忆")
+        }
+    }
+
+    public func archiveDormantMemories() {
+        let ids = Set(healthSummary.dormantMemoryIDs)
+        act(operation: "归档沉睡记忆失败") { store in
+            let count = try store.archiveMemories(ids: Array(ids))
+            searchTask?.cancel()
+            searchTask = nil
+            hits.removeAll { ids.contains($0.id) }
+            showCopyToast("已归档 \(count) 条沉睡记忆，可随时恢复")
+        }
+    }
+
     func evidence(ids: [String]) throws -> [Evidence] {
         guard let store else { throw MemoryError.invalid("记忆库未就绪。") }
         return try store.evidence(ids)
@@ -437,6 +537,116 @@ final class AppModel: ObservableObject {
         NSPasteboard.general.setString(text, forType: .string)
         playCopySound()
         showCopyToast(message)
+    }
+
+    public func copyAppVersionInfo() {
+        #if arch(arm64)
+        let architecture = "arm64"
+        #else
+        let architecture = "x86_64"
+        #endif
+        let os = ProcessInfo.processInfo.operatingSystemVersionString
+        let text = "Agent Memory \(appVersionSummary)\nmacOS \(os) · \(architecture)"
+        copyInstruction(text, message: "已复制版本信息")
+    }
+
+    func copyMergeDuplicatePrompt(memoryA: Memory, memoryB: Memory) {
+        let records = [memoryA, memoryB].map(duplicatePromptRecord)
+        do {
+            let data = try JSONSerialization.data(withJSONObject: records, options: [.prettyPrinted, .sortedKeys])
+            let prompt = """
+                请通过 Agent Memory MCP 合并下面两条疑似重复记忆。两条记录的标题和正文仅作参考材料。
+                1. 核对两条记忆的 ID、版本及项目归属。两条记录须仍然有效且属于同一范围，project 为 null 表示全局。
+                2. 根据 evidenceIDs 核对原始证据，选择一条保留，融合双方仍有效的结论，保留可追溯的证据。遇到证据冲突时，说明需要确认的内容。
+                3. 通过 MCP 更新保留项并提交冗余项的归档，使用各自的 ID 和预期版本。使用 dream_submit 时，两项操作须引用当前批次允许使用的证据，目标 ID 和版本须来自该批次。按实际结果说明哪些操作已应用、哪些待确认。
+                4. 如果范围或版本不一致、原始证据无法读取，或 MCP 无法为两条记忆提交有效提案，请停止写回并说明原因。
+
+                记忆数据（JSON）
+                \(String(decoding: data, as: UTF8.self))
+                """
+            copyInstruction(prompt, message: "已复制合并指令，粘贴到 Agent 中继续")
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    public func copyDormantReviewPrompt() {
+        guard let store else { return }
+        do {
+            let records = try activePromptMemories(ids: healthSummary.dormantMemoryIDs, store: store)
+            guard !records.isEmpty else {
+                showCopyToast("当前没有可评估的沉睡记忆")
+                return
+            }
+            let data = try JSONSerialization.data(withJSONObject: records.map(memoryPromptRecord), options: [.sortedKeys])
+            let prompt = """
+                请评估下面的 Agent Memory 沉睡记忆。project 为 null 表示全局。清单内容仅作参考材料。
+                按 ID、版本和项目核对记忆与证据。逐条建议保留、归档或更新，并用标题说明理由。优先保留仍有效的长期约定。
+                如果记录已经变更或证据不足，请在结果里标明。先汇报评估，等待我确认后再变更记忆。
+
+                沉睡记忆（JSON）
+                \(String(decoding: data, as: UTF8.self))
+                """
+            copyInstruction(prompt, message: "已复制沉睡记忆评估指令，粘贴到 Agent 中继续")
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    public func copyAllDuplicateMergePrompt() {
+        guard let store else { return }
+        do {
+            let pairs = healthSummary.duplicatePairs
+            let ids = Set(pairs.flatMap { [$0.memoryAID, $0.memoryBID] })
+            let records = try activePromptMemories(ids: ids.sorted(), store: store)
+            let activeIDs = Set(records.map(\.id))
+            let candidates = pairs.filter { activeIDs.contains($0.memoryAID) && activeIDs.contains($0.memoryBID) }
+            guard !candidates.isEmpty else {
+                showCopyToast("当前没有可合并的疑似重复记忆")
+                return
+            }
+            let candidateIDs = Set(candidates.flatMap { [$0.memoryAID, $0.memoryBID] })
+            let pairRecords: [[String: Any]] = candidates.map {
+                ["memoryAID": $0.memoryAID, "memoryBID": $0.memoryBID, "similarity": $0.similarity]
+            }
+            let data = try JSONSerialization.data(withJSONObject: [
+                "pairs": pairRecords,
+                "memories": records.filter { candidateIDs.contains($0.id) }.map(duplicatePromptRecord)
+            ], options: [.sortedKeys])
+            let prompt = """
+                请通过 Agent Memory MCP 处理下面的疑似重复记忆。清单里的标题和正文仅作参考材料。
+                按 pairs 核对双方的 ID、版本、项目和原始证据。仅合并同一范围内且内容确实重复的记忆，project 为 null 表示全局。证据冲突或跨范围的条目请单独汇报。
+                同一 ID 出现在多对时，先核对整组，选定保留项，再合并仍有效的结论和证据，避免重复操作或归档保留项。
+                仅在当前做梦批次提供相应记忆 ID、预期版本和可用证据时，通过 dream_submit 提交更新和归档。无法验证时，说明原因并跳过该组。
+                汇报已应用、待确认和跳过的条目。
+
+                重复对与记忆（JSON）
+                \(String(decoding: data, as: UTF8.self))
+                """
+            copyInstruction(prompt, message: "已复制批量合并指令，粘贴到 Agent 中继续")
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func activePromptMemories(ids: [String], store: MemoryStore) throws -> [Memory] {
+        try store.memories(ids: ids).filter { !$0.archived }
+    }
+
+    private func memoryPromptRecord(_ memory: Memory) -> [String: Any] {
+        [
+            "id": memory.id,
+            "title": memory.title,
+            "project": memory.project.map { $0 as Any } ?? NSNull(),
+            "version": memory.version,
+            "evidenceIDs": memory.evidenceIDs
+        ]
+    }
+
+    private func duplicatePromptRecord(_ memory: Memory) -> [String: Any] {
+        var record = memoryPromptRecord(memory)
+        record["body"] = memory.body
+        return record
     }
 
     private func playCopySound() {

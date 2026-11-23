@@ -54,6 +54,15 @@ case "--setup-antigravity":
         FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
         exit(1)
     }
+case ProjectMigrationCommand.flag:
+    do {
+        let result = try ProjectMigrationCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)), socket: socket)
+        print(String(decoding: result, as: UTF8.self))
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+        exit(1)
+    }
 default:
     break
 }
@@ -102,7 +111,7 @@ while let line = readLine() {
     case "tools/call":
         do {
             guard let name = params["name"] as? String,
-                  ["dream_get_batch", "dream_submit", "memory_search"].contains(name) else {
+                  MCPTools.definitions.contains(where: { $0["name"] as? String == name }) else {
                 throw MemoryError.invalid("未知工具。")
             }
             var request = params

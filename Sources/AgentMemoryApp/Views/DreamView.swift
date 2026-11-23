@@ -6,38 +6,51 @@ struct DreamView: View {
     @ObservedObject var model: AppModel
     @Binding var pickedDecision: Decision?
     @Binding var pendingUndo: String?
+    @Binding var focusProposals: Bool
     let onInspectDecision: (Decision) -> Void
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                headerRow
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    headerRow
 
-                if let dashboard = model.dashboard {
-                    if dashboard.decisions.isEmpty && dashboard.evidence.isEmpty && dashboard.batchSummaries.isEmpty {
-                        EmptyStateCard(
-                            icon: "moon.stars",
-                            title: "暂无待处理记录",
-                            description: "当 Codex 或 Antigravity 产生新的对话记录时，会自动进入待做梦队列。"
-                        )
-                    }
+                    if let dashboard = model.dashboard {
+                        if dashboard.decisions.isEmpty && dashboard.evidence.isEmpty && dashboard.batchSummaries.isEmpty {
+                            EmptyStateCard(
+                                icon: "moon.stars",
+                                title: "暂无待处理记录",
+                                description: "当 Codex 或 Antigravity 产生新的对话记录时，会自动进入待做梦队列。"
+                            )
+                        }
 
-                    if !dashboard.decisions.isEmpty {
-                        proposalsSection(dashboard.decisions)
-                    }
+                        if !dashboard.decisions.isEmpty {
+                            proposalsSection(dashboard.decisions)
+                                .id("dream-proposals")
+                        }
 
-                    if !dashboard.evidence.isEmpty {
-                        pendingEvidenceSection(dashboard.evidence)
-                    }
+                        if !dashboard.evidence.isEmpty {
+                            pendingEvidenceSection(dashboard.evidence)
+                        }
 
-                    if !dashboard.batchSummaries.isEmpty {
-                        batchHistorySection(dashboard.batchSummaries)
+                        if !dashboard.batchSummaries.isEmpty {
+                            batchHistorySection(dashboard.batchSummaries)
+                        }
                     }
                 }
+                .padding(24)
             }
-            .padding(24)
+            .background(Color.clear)
+            .task(id: focusProposals) {
+                guard focusProposals else { return }
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo("dream-proposals", anchor: .top)
+                }
+                focusProposals = false
+            }
         }
-        .background(Color.clear)
     }
 
     // MARK: - Header
@@ -71,7 +84,7 @@ struct DreamView: View {
     // MARK: - Pending & Conflict Proposals (Side-by-Side Diff)
 
     private func proposalsSection(_ decisions: [Decision]) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        LazyVStack(alignment: .leading, spacing: 12) {
             SectionHeader("待确认与冲突提案", count: decisions.count) {
                 Text("并排对比旧版本与拟议变更，可逐条确认或拒绝")
                     .font(.caption)
@@ -98,7 +111,7 @@ struct DreamView: View {
     // MARK: - Pending Evidence Queue
 
     private func pendingEvidenceSection(_ evidence: [Evidence]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        LazyVStack(alignment: .leading, spacing: 10) {
             SectionHeader("待做梦记录", count: evidence.count)
             ForEach(evidence) { record in
                 HStack(alignment: .top, spacing: 12) {
@@ -135,7 +148,7 @@ struct DreamView: View {
     // MARK: - Batch History
 
     private func batchHistorySection(_ summaries: [DreamBatchSummary]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        LazyVStack(alignment: .leading, spacing: 10) {
             SectionHeader("批次历史", count: summaries.count)
             ForEach(summaries) { summary in
                 HStack(alignment: .center, spacing: 12) {
@@ -195,6 +208,45 @@ struct DreamView: View {
 
 // MARK: - Proposal Side-by-Side Diff Card
 
+@MainActor
+private final class ProposalDiffLoader: ObservableObject {
+    @Published var previousMemory: Memory?
+    @Published var citedEvidence: [Evidence] = []
+    private var loadedDecisionID: String?
+
+    func loadIfNeeded(decision: Decision, store: MemoryStore?) async {
+        guard loadedDecisionID != decision.id else { return }
+        loadedDecisionID = decision.id
+        guard let store else {
+            previousMemory = nil
+            citedEvidence = []
+            return
+        }
+
+        let memoryID = decision.proposal.memoryID
+        let expectedVersion = decision.proposal.expectedVersion
+        let evidenceIDs = decision.proposal.evidenceIDs
+
+        let result = await Task.detached(priority: .userInitiated) { () -> (Memory?, [Evidence]) in
+            var oldMem: Memory? = nil
+            if let id = memoryID {
+                if let expected = expectedVersion,
+                   let exact = try? store.memory(id: id, version: expected) {
+                    oldMem = exact
+                } else {
+                    oldMem = try? store.memory(id: id, version: nil)
+                }
+            }
+            let ev: [Evidence] = evidenceIDs.isEmpty ? [] : ((try? store.evidence(evidenceIDs)) ?? [])
+            return (oldMem, ev)
+        }.value
+
+        guard !Task.isCancelled else { return }
+        previousMemory = result.0
+        citedEvidence = result.1
+    }
+}
+
 private struct DreamProposalDiffCard: View {
     @Environment(\.theme) private var theme
     @ObservedObject var model: AppModel
@@ -204,20 +256,7 @@ private struct DreamProposalDiffCard: View {
     let onReview: (Bool) -> Void
 
     @StateObject private var showEvidence = LocalState(true)
-
-    private var previousMemory: Memory? {
-        guard let id = decision.proposal.memoryID else { return nil }
-        if let expected = decision.proposal.expectedVersion,
-           let exact = try? model.memory(id: id, version: expected) {
-            return exact
-        }
-        return try? model.memory(id: id, version: nil)
-    }
-
-    private var citedEvidence: [Evidence] {
-        guard !decision.proposal.evidenceIDs.isEmpty else { return [] }
-        return (try? model.evidence(ids: decision.proposal.evidenceIDs)) ?? []
-    }
+    @StateObject private var loader = ProposalDiffLoader()
 
     private var operationBadge: (label: String, tint: Color) {
         switch decision.proposal.operation {
@@ -242,12 +281,12 @@ private struct DreamProposalDiffCard: View {
         if let project = decision.proposal.project, !project.isEmpty {
             return project
         }
-        return previousMemory?.project
+        return loader.previousMemory?.project
     }
 
     var body: some View {
-        let oldMemory = previousMemory
-        let evidenceList = citedEvidence
+        let oldMemory = loader.previousMemory
+        let evidenceList = loader.citedEvidence
         let op = operationBadge
         let st = statusBadge
 
@@ -360,6 +399,9 @@ private struct DreamProposalDiffCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .surfaceCard(cornerRadius: 12, padding: 14, highlighted: isSelected)
+        .task(id: decision.id) {
+            await loader.loadIfNeeded(decision: decision, store: model.store)
+        }
     }
 
     private func oldContentPane(_ oldMemory: Memory?) -> some View {

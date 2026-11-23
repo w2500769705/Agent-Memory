@@ -16,8 +16,11 @@ public enum CodexSource {
         使用 agent-memory MCP，分批处理点击时所有项目的待做梦记录。
         每次用 dream_get_batch 传入 limit: 8、through: \(through)，省略 project。
         依据证据提炼可复用的记忆。每条记录都要有处置，临时内容用 skip。
-        每批用 dream_submit 提交成功后再领下一批。领取返回 empty 时结束。
-        如果工具出错，或提交返回版本冲突，停止继续领取并说明原因，保留已提交的批次。
+        \(MCPTools.dreamProjectGuidance)
+        \(MCPTools.dreamSubmitGuidance)
+        提交前逐项对照 evidenceIDs 与证据的 project。项目提案有路径不符时，先修正本批提案，并为移出的证据单独决定处置。
+        每批用 dream_submit 提交成功后再领下一批。领取返回 empty 时结束，按 message 汇报是否仍有记录被批次占用。
+        重提仍失败或遇到其他工具错误时，停止领取并汇报原因、批次编号和实际退回结果。
         最后汇报处理的批次、写入、待确认和跳过数量。
         """
     }
@@ -174,10 +177,9 @@ public enum CodexSource {
     package static func evidence(turn: [String: Any], threadID: String, project: String, timestamp: Double) -> Evidence? {
         guard turn["status"] as? String == "completed", let id = turn["id"] as? String,
               let items = turn["items"] as? [[String: Any]] else { return nil }
-        let dreamTools = ["dream_get_batch", "dream_submit"]
         if items.contains(where: { item in
             (item["type"] as? String) == "mcpToolCall" &&
-            (item["tool"] as? String).map(dreamTools.contains) == true
+            (item["tool"] as? String).map(MCPTools.dreamToolNames.contains) == true
         }) { return nil }
         let user = items.filter { $0["type"] as? String == "userMessage" }
             .flatMap { $0["content"] as? [[String: Any]] ?? [] }

@@ -258,7 +258,7 @@ public enum AntigravitySource {
     }
 
     private static func isDreamToolCall(_ call: [String: Any]) -> Bool {
-        let dreamTools = ["dream_get_batch", "dream_submit"]
+        let dreamTools = MCPTools.dreamToolNames
         if let name = call["name"] as? String, dreamTools.contains(where: { name.contains($0) }) {
             return true
         }

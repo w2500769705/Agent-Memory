@@ -40,17 +40,15 @@ private struct Vec3 {
 }
 
 private struct GalaxyClusterMeta {
-    let key: String
     let label: String
-    let isGlobal: Bool
-    let projectPath: String?
     let colorIndex: Int
-    let anchor: Vec3
 }
 
 private struct GalaxyPhysicsNode {
     let node: MemoryGraphNode
     let clusterIndex: Int
+    let home: Vec3
+    let prominence: Double
     var position: Vec3
     var velocity: Vec3
 }
@@ -67,10 +65,36 @@ private struct ProjectedStar {
     let index: Int
     let node: MemoryGraphNode
     let clusterIndex: Int
-    let screen: CGPoint
+    var screen: CGPoint
     let depth: Double          // rotated Z (larger = closer to viewer)
     let perspective: Double    // scale factor from perspective projection
     let radius: CGFloat
+}
+
+private struct GalaxyCloud {
+    let meta: GalaxyClusterMeta
+    let centroid: CGPoint
+    let spread: CGFloat
+    let bounds: CGRect
+    let memberCount: Int
+    let avgDepth: Double
+    let avgPerspective: Double
+    let hasPulse: Bool
+}
+
+private struct ProjectionCell: Hashable {
+    let column: Int
+    let row: Int
+
+    init(point: CGPoint) {
+        column = Int(floor(point.x / 24))
+        row = Int(floor(point.y / 24))
+    }
+
+    init(column: Int, row: Int) {
+        self.column = column
+        self.row = row
+    }
 }
 
 private struct BackgroundStardust {
@@ -96,12 +120,17 @@ private final class GalaxyEngine: ObservableObject {
     var lastMode: MemoryGalaxyMode = .interactiveFull
 
     // Camera state
-    var yaw: Double = 0.35
-    var pitch: Double = 0.22
+    private static let defaultYaw: Double = 0.35
+    private static let defaultPitch: Double = 0.56
+    var yaw: Double = defaultYaw
+    var pitch: Double = defaultPitch
+    var zoomScale: Double = 1.0
     var yawVelocity: Double = 0
     var pitchVelocity: Double = 0
     var autoRotateSpeedFactor: Double = 1.0
     var lastTickDate: Date?
+    var lastInteractionDate: Date = .distantPast
+    var isSmoothResetting: Bool = false
 
     // Drag interaction state
     var isDraggingSpace = false
@@ -110,7 +139,7 @@ private final class GalaxyEngine: ObservableObject {
 
     // SwiftUI-observed lightweight UI state
     @Published var isAutoRotating = true
-    @Published var scale: CGFloat = 1.0
+    @Published var displayedZoomPercent: Int = 100
     @Published var pinchMagnification: CGFloat = 1.0
     @Published var hoveredNodeID: String? = nil
     @Published var hoverLocation: CGPoint = .zero
@@ -146,19 +175,39 @@ private final class GalaxyEngine: ObservableObject {
     }
 
     var effectiveScale: CGFloat {
-        min(max(scale * pinchMagnification, 0.55), 2.8)
+        min(max(CGFloat(zoomScale) * pinchMagnification, 0.55), 2.8)
+    }
+
+    func markInteraction() {
+        lastInteractionDate = Date()
+        isSmoothResetting = false
+    }
+
+    func setZoomScale(_ newValue: Double) {
+        zoomScale = min(max(newValue, 0.55), 2.8)
+        let pct = Int((effectiveScale * 100).rounded())
+        if displayedZoomPercent != pct {
+            displayedZoomPercent = pct
+        }
+    }
+
+    func beginSmoothReset() {
+        isSmoothResetting = true
+        yawVelocity = 0
+        pitchVelocity = 0
+        pinchMagnification = 1.0
+    }
+
+    private static let globalKey = "__global__"
+    private static let goldenAngle = Double.pi * (3 - sqrt(5))
+
+    private static func clusterKey(for node: MemoryGraphNode) -> String {
+        guard node.scope != "global", let project = node.project, !project.isEmpty else { return globalKey }
+        return project
     }
 
     static func clusterCount(for graph: MemoryGraph) -> Int {
-        guard !graph.nodes.isEmpty else { return 0 }
-        var keys = Set<String>()
-        for node in graph.nodes {
-            let key = (node.scope == "global" || node.project == nil || node.project?.isEmpty == true)
-                ? "__global__"
-                : (node.project ?? "__global__")
-            keys.insert(key)
-        }
-        return keys.count
+        Set(graph.nodes.map(clusterKey)).count
     }
 
     func syncGraph(_ graph: MemoryGraph) {
@@ -166,219 +215,113 @@ private final class GalaxyEngine: ObservableObject {
         guard sig != graphSignature else { return }
         graphSignature = sig
 
-        // Preserve existing positions for smooth incremental updates
-        var oldPositions: [String: Vec3] = [:]
-        for item in nodes {
-            oldPositions[item.node.id] = item.position
-        }
-
-        let allNodes = graph.nodes
-        guard !allNodes.isEmpty else {
-            clusters = []
-            nodes = []
-            edges = []
-            idToIndex = [:]
-            lastProjected = []
-            return
-        }
-
-        // 1. Bucket by scope / project
-        var scopeBuckets: [String: [MemoryGraphNode]] = [:]
-        for node in allNodes {
-            let key = (node.scope == "global" || node.project == nil || node.project?.isEmpty == true)
-                ? "__global__"
-                : (node.project ?? "__global__")
-            scopeBuckets[key, default: []].append(node)
-        }
-
-        // 2. Refine large buckets into semantic sub-clusters using union-find on strong edges
-        var strongAdjacency: [String: [String]] = [:]
-        for edge in graph.edges {
-            let isStrong = (edge.kind == .duplicate)
-                || (edge.kind == .sharedEvidence)
-                || (edge.kind == .semantic && edge.weight >= 0.48)
-            if isStrong {
-                strongAdjacency[edge.sourceID, default: []].append(edge.targetID)
-                strongAdjacency[edge.targetID, default: []].append(edge.sourceID)
-            }
-        }
-
-        struct RawCluster {
-            let key: String
-            let label: String
-            let isGlobal: Bool
-            let projectPath: String?
-            let members: [MemoryGraphNode]
-        }
-
-        var rawClusters: [RawCluster] = []
-        let sortedScopeKeys = scopeBuckets.keys.sorted { a, b in
-            if a == "__global__" { return true }
-            if b == "__global__" { return false }
-            let ca = scopeBuckets[a]?.count ?? 0
-            let cb = scopeBuckets[b]?.count ?? 0
-            if ca != cb { return ca > cb }
+        let oldNodes = Dictionary(uniqueKeysWithValues: nodes.map { ($0.node.id, $0) })
+        let draggedID = draggedNodeIndex.flatMap { nodes.indices.contains($0) ? nodes[$0].node.id : nil }
+        let groups = Dictionary(grouping: graph.nodes, by: Self.clusterKey)
+        let keys = groups.keys.sorted { a, b in
+            if a == Self.globalKey || b == Self.globalKey { return a == Self.globalKey && b != Self.globalKey }
             return a < b
         }
 
-        for scopeKey in sortedScopeKeys {
-            guard let bucket = scopeBuckets[scopeKey], !bucket.isEmpty else { continue }
-            let isGlobal = scopeKey == "__global__"
-            let baseLabel = isGlobal ? "全局记忆" : (URL(fileURLWithPath: scopeKey).lastPathComponent.isEmpty ? scopeKey : URL(fileURLWithPath: scopeKey).lastPathComponent)
-            let projectPath: String? = isGlobal ? nil : scopeKey
-
-            if bucket.count >= 14 {
-                let memberSet = Set(bucket.map(\.id))
-                var visited = Set<String>()
-                var components: [[MemoryGraphNode]] = []
-                let byID = Dictionary(uniqueKeysWithValues: bucket.map { ($0.id, $0) })
-
-                for node in bucket {
-                    guard !visited.contains(node.id) else { continue }
-                    var queue = [node.id]
-                    visited.insert(node.id)
-                    var comp: [MemoryGraphNode] = []
-                    while !queue.isEmpty {
-                        let cur = queue.removeFirst()
-                        if let m = byID[cur] { comp.append(m) }
-                        for nxt in strongAdjacency[cur] ?? [] where memberSet.contains(nxt) && !visited.contains(nxt) {
-                            visited.insert(nxt)
-                            queue.append(nxt)
-                        }
-                    }
-                    components.append(comp)
-                }
-
-                // Keep meaningful sub-clusters (>= 4 nodes) and merge tiny fragments into the largest
-                let major = components.filter { $0.count >= 4 }.sorted { $0.count > $1.count }
-                if major.count >= 2 {
-                    var merged = major
-                    let minors = components.filter { $0.count < 4 }.flatMap { $0 }
-                    if !minors.isEmpty {
-                        merged[0].append(contentsOf: minors)
-                    }
-                    for (subIdx, comp) in merged.enumerated() {
-                        let subLabel = subIdx == 0 ? baseLabel : "\(baseLabel) · 星簇 \(subIdx + 1)"
-                        rawClusters.append(RawCluster(
-                            key: "\(scopeKey)#\(subIdx)",
-                            label: subLabel,
-                            isGlobal: isGlobal,
-                            projectPath: projectPath,
-                            members: comp
-                        ))
-                    }
-                    continue
-                }
-            }
-
-            rawClusters.append(RawCluster(
-                key: scopeKey,
-                label: baseLabel,
-                isGlobal: isGlobal,
-                projectPath: projectPath,
-                members: bucket
-            ))
+        var connectivity: [String: Double] = [:]
+        for edge in graph.edges {
+            let contribution = 0.5 + edge.weight
+            connectivity[edge.sourceID, default: 0] += contribution
+            connectivity[edge.targetID, default: 0] += contribution
         }
 
-        // 3. Place cluster anchors cleanly in 3D space (Fibonacci sphere distribution)
-        let clusterCount = rawClusters.count
         var builtClusters: [GalaxyClusterMeta] = []
-        builtClusters.reserveCapacity(clusterCount)
-
-        let goldenAngle = Double.pi * (3.0 - sqrt(5.0))
-        for (idx, raw) in rawClusters.enumerated() {
-            let anchor: Vec3
-            if clusterCount == 1 {
-                anchor = .zero
-            } else if clusterCount == 2 {
-                let sign = idx == 0 ? -1.0 : 1.0
-                anchor = Vec3(x: sign * 0.56, y: sign * 0.14, z: sign * 0.22)
-            } else {
-                let y = 1.0 - (Double(idx) / Double(max(clusterCount - 1, 1))) * 1.65 - 0.12
-                let radiusAtY = sqrt(max(1.0 - y * y * 0.65, 0.15))
-                let theta = goldenAngle * Double(idx) + 0.4
-                let shellRadius = clusterCount <= 4 ? 0.68 : 0.82
-                anchor = Vec3(
-                    x: cos(theta) * radiusAtY * shellRadius,
-                    y: y * 0.48 * shellRadius,
-                    z: sin(theta) * radiusAtY * shellRadius
-                )
-            }
-
-            let colorIndex = raw.isGlobal ? 0 : (1 + (idx % 5))
-            builtClusters.append(GalaxyClusterMeta(
-                key: raw.key,
-                label: raw.label,
-                isGlobal: raw.isGlobal,
-                projectPath: raw.projectPath,
-                colorIndex: colorIndex,
-                anchor: anchor
-            ))
-        }
-
-        // 4. Spawn 3D physics nodes around each cluster anchor
         var builtNodes: [GalaxyPhysicsNode] = []
         var lookup: [String: Int] = [:]
-        builtNodes.reserveCapacity(allNodes.count)
+        builtNodes.reserveCapacity(graph.nodes.count)
 
-        for (cIdx, raw) in rawClusters.enumerated() {
-            let anchor = builtClusters[cIdx].anchor
-            let ordered = raw.members.sorted {
-                if $0.hitCount != $1.hitCount { return $0.hitCount > $1.hitCount }
-                if $0.updated != $1.updated { return $0.updated > $1.updated }
-                return $0.id < $1.id
+        for (index, key) in keys.enumerated() {
+            guard let members = groups[key] else { continue }
+            let isGlobal = key == Self.globalKey
+            let name = URL(fileURLWithPath: key).lastPathComponent
+            let colorIndex = isGlobal ? 0 : (1 + Int(Self.stableUnitHash(key) * 5))
+            builtClusters.append(GalaxyClusterMeta(label: isGlobal ? "全局记忆" : (name.isEmpty ? key : name), colorIndex: colorIndex))
+
+            let anchor = Self.clusterAnchor(index: index, count: keys.count)
+            let ranked = members.map { node in
+                let score = 2 * log1p(Double(node.hitCount)) + 1.5 * log1p(connectivity[node.id, default: 0])
+                return (node: node, score: score)
+            }.sorted { left, right in
+                if left.score != right.score { return left.score > right.score }
+                if left.node.updated != right.node.updated { return left.node.updated > right.node.updated }
+                return left.node.id < right.node.id
             }
-            let spread = clusterCount <= 1 ? 0.52 : 0.30
-            for (i, node) in ordered.enumerated() {
-                let initialPos: Vec3
-                if let existing = oldPositions[node.id] {
-                    initialPos = existing
-                } else if ordered.count == 1 {
-                    initialPos = anchor
-                } else {
-                    let t = (Double(i) + 0.5) / Double(ordered.count)
-                    let phi = acos(1.0 - 2.0 * t)
-                    let theta = goldenAngle * Double(i) + Self.stableUnitHash(node.id) * 0.6
-                    let r = spread * (0.35 + 0.65 * pow(t, 0.45))
-                    initialPos = Vec3(
-                        x: anchor.x + sin(phi) * cos(theta) * r,
-                        y: anchor.y + cos(phi) * r * 0.85,
-                        z: anchor.z + sin(phi) * sin(theta) * r
-                    )
-                }
+
+            for (rank, member) in ranked.enumerated() {
+                let node = member.node
+                let home = anchor + Self.orbitOffset(rank: rank, count: ranked.count, id: node.id)
+                let prominence = 0.80 * exp(-Double(rank) * 0.48) + min(member.score / 18, 0.20)
+                let previous = oldNodes[node.id].flatMap { Self.clusterKey(for: $0.node) == key ? $0 : nil }
                 lookup[node.id] = builtNodes.count
                 builtNodes.append(GalaxyPhysicsNode(
                     node: node,
-                    clusterIndex: cIdx,
-                    position: initialPos,
-                    velocity: .zero
+                    clusterIndex: index,
+                    home: home,
+                    prominence: prominence,
+                    position: previous?.position ?? home,
+                    velocity: previous?.velocity ?? .zero
                 ))
             }
         }
 
-        // 5. Build indexed physics edges
-        var builtEdges: [GalaxyPhysicsEdge] = []
-        builtEdges.reserveCapacity(graph.edges.count)
-        for edge in graph.edges {
-            guard let s = lookup[edge.sourceID], let t = lookup[edge.targetID], s != t else { continue }
-            builtEdges.append(GalaxyPhysicsEdge(
-                sourceIndex: s,
-                targetIndex: t,
+        clusters = builtClusters
+        nodes = builtNodes
+        idToIndex = lookup
+        edges = graph.edges.compactMap { edge in
+            guard let source = lookup[edge.sourceID], let target = lookup[edge.targetID], source != target else { return nil }
+            return GalaxyPhysicsEdge(
+                sourceIndex: source,
+                targetIndex: target,
                 kind: edge.kind,
                 weight: edge.weight,
-                sameCluster: builtNodes[s].clusterIndex == builtNodes[t].clusterIndex
-            ))
+                sameCluster: builtNodes[source].clusterIndex == builtNodes[target].clusterIndex
+            )
+        }
+        draggedNodeIndex = draggedID.flatMap { lookup[$0] }
+        lastProjected = []
+
+        if oldNodes.isEmpty {
+            for _ in 0..<16 { stepPhysics(dt: 1.0 / 60.0) }
+        }
+    }
+
+    private static func clusterAnchor(index: Int, count: Int) -> Vec3 {
+        if count == 1 { return .zero }
+        if count == 2 {
+            let sign = index == 0 ? -1.0 : 1.0
+            return Vec3(x: sign * 0.76, y: sign * 0.18, z: sign * 0.12)
         }
 
-        self.clusters = builtClusters
-        self.nodes = builtNodes
-        self.edges = builtEdges
-        self.idToIndex = lookup
+        let latitude = 1 - 2 * (Double(index) + 0.5) / Double(count)
+        let ring = sqrt(1 - latitude * latitude)
+        let azimuth = goldenAngle * Double(index) + 0.4
+        let shell = count <= 5 ? 0.85 : 1.0
+        return Vec3(
+            x: cos(azimuth) * ring * shell,
+            y: latitude * 0.67 * shell,
+            z: sin(azimuth) * ring * shell
+        )
+    }
 
-        // Warm-start physics for 14 steps so initial layout is already organically relaxed
-        for _ in 0..<14 {
-            stepPhysics(dt: 1.0 / 60.0)
-        }
+    private static func orbitOffset(rank: Int, count: Int, id: String) -> Vec3 {
+        guard rank > 0 else { return .zero }
+        let spread = min(0.17 + pow(Double(count), 1.0 / 3.0) * 0.118, 0.96)
+        let fraction = Double(rank) / Double(count - 1)
+        let jitter = stableUnitHash(id)
+        let radius = spread * (0.22 + 0.78 * pow(fraction, 1.0 / 3.0)) * (0.92 + jitter * 0.16)
+        let azimuth = goldenAngle * Double(rank) + jitter * 0.55
+        let latitude = (Double(rank) * 0.754877666).truncatingRemainder(dividingBy: 1) * 2 - 1
+        let ring = sqrt(1 - latitude * latitude)
+        return Vec3(
+            x: cos(azimuth) * ring * radius,
+            y: latitude * radius * 0.72,
+            z: sin(azimuth) * ring * radius
+        )
     }
 
     func tick(now: Date) {
@@ -399,19 +342,67 @@ private final class GalaxyEngine: ObservableObject {
 
         // Slow, dignified 3D rotation + drag inertia
         if !isDraggingSpace {
-            yaw += (0.095 * autoRotateSpeedFactor + yawVelocity) * dt
-            pitch += pitchVelocity * dt
-            let inertiaDecay = pow(0.06, dt)
-            yawVelocity *= inertiaDecay
-            pitchVelocity *= inertiaDecay
-            if abs(yawVelocity) < 0.001 { yawVelocity = 0 }
-            if abs(pitchVelocity) < 0.001 { pitchVelocity = 0 }
+            if !isSmoothResetting {
+                yaw += (0.038 * autoRotateSpeedFactor + yawVelocity) * dt
+                pitch += pitchVelocity * dt
+                let inertiaDecay = pow(0.06, dt)
+                yawVelocity *= inertiaDecay
+                pitchVelocity *= inertiaDecay
+                if abs(yawVelocity) < 0.001 { yawVelocity = 0 }
+                if abs(pitchVelocity) < 0.001 { pitchVelocity = 0 }
+            }
 
             // Gently clamp pitch so universe never flips awkwardly upside down
             if pitch > 1.15 {
                 pitch += (1.15 - pitch) * min(dt * 8.0, 1.0)
             } else if pitch < -1.15 {
                 pitch += (-1.15 - pitch) * min(dt * 8.0, 1.0)
+            }
+
+            // Auto-recenter & zoom reset in ambientBackdrop after 3.0s idle without hovering a node
+            let isPinching = abs(pinchMagnification - 1.0) >= 0.001
+            if lastMode == .ambientBackdrop {
+                if draggedNodeIndex == nil && !isPinching && hoveredNodeID == nil && now.timeIntervalSince(lastInteractionDate) >= 3.0 {
+                    let lerpFactor = 1.0 - exp(-dt * 2.2)
+                    if abs(zoomScale - 1.0) > 0.001 {
+                        zoomScale += (1.0 - zoomScale) * lerpFactor
+                    } else {
+                        zoomScale = 1.0
+                    }
+                    if abs(pitch - Self.defaultPitch) > 0.001 {
+                        pitch += (Self.defaultPitch - pitch) * lerpFactor
+                    } else {
+                        pitch = Self.defaultPitch
+                    }
+                }
+            } else if isSmoothResetting {
+                let lerpFactor = 1.0 - exp(-dt * 5.2)
+                zoomScale += (1.0 - zoomScale) * lerpFactor
+                pitch += (Self.defaultPitch - pitch) * lerpFactor
+
+                let twoPi = Double.pi * 2.0
+                var yawDiff = (Self.defaultYaw - yaw).truncatingRemainder(dividingBy: twoPi)
+                if yawDiff > Double.pi { yawDiff -= twoPi }
+                if yawDiff < -Double.pi { yawDiff += twoPi }
+                yaw += yawDiff * lerpFactor
+
+                let pct = Int((effectiveScale * 100).rounded())
+                if displayedZoomPercent != pct {
+                    Task { @MainActor [weak self] in
+                        self?.displayedZoomPercent = pct
+                    }
+                }
+
+                if abs(zoomScale - 1.0) < 0.002 && abs(pitch - Self.defaultPitch) < 0.002 && abs(yawDiff) < 0.002 {
+                    zoomScale = 1.0
+                    pitch = Self.defaultPitch
+                    isSmoothResetting = false
+                    if displayedZoomPercent != 100 {
+                        Task { @MainActor [weak self] in
+                            self?.displayedZoomPercent = 100
+                        }
+                    }
+                }
             }
         }
 
@@ -424,63 +415,65 @@ private final class GalaxyEngine: ObservableObject {
 
         var forces = Array(repeating: Vec3.zero, count: count)
 
-        // 1. Cluster gravity well
-        let gravityStrength = 1.85
-        for i in 0..<count {
-            let anchor = clusters[nodes[i].clusterIndex].anchor
-            let diff = anchor - nodes[i].position
-            forces[i] += diff * gravityStrength
+        // The highest-ranked star is tethered to the core. Companions have individual orbital offsets.
+        for i in nodes.indices {
+            let node = nodes[i]
+            forces[i] += (node.home - node.position) * (3.0 + node.prominence * 5.5)
         }
 
-        // 2. Semantic edge springs (Hooke's law)
+        // Intra-galaxy links let related companions form groups within the same gravitational field.
         for edge in edges {
             let a = edge.sourceIndex
             let b = edge.targetIndex
             let delta = nodes[b].position - nodes[a].position
-            let dist = max(delta.length, 0.004)
+            let distance = max(delta.length, 0.004)
             let restLength: Double
-            let k: Double
-            switch edge.kind {
-            case .duplicate:
-                restLength = 0.11
-                k = 3.6
-            case .semantic:
-                restLength = edge.sameCluster ? 0.22 : 0.56
-                k = (edge.sameCluster ? 1.55 : 0.35) * max(edge.weight, 0.35)
-            case .sharedEvidence:
-                restLength = edge.sameCluster ? 0.25 : 0.62
-                k = edge.sameCluster ? 0.95 : 0.22
+            let stiffness: Double
+            if edge.sameCluster {
+                switch edge.kind {
+                case .duplicate:
+                    restLength = 0.25
+                    stiffness = 1.45
+                case .semantic:
+                    restLength = 0.33
+                    stiffness = 0.78 * max(edge.weight, 0.35)
+                case .sharedEvidence:
+                    restLength = 0.31
+                    stiffness = 0.82
+                }
+            } else {
+                let homeDistance = (nodes[a].home - nodes[b].home).length
+                restLength = max(homeDistance, 0.52)
+                stiffness = 0.08
             }
-            let stretch = (dist - restLength) / dist
-            let f = delta * (stretch * k)
-            forces[a] += f
-            forces[b] += f * -1.0
+            let force = delta * ((distance - restLength) / distance * stiffness)
+            forces[a] += force
+            forces[b] += force * -1
         }
 
-        // 3. Pairwise 3D short-range repulsion
-        let minSep = count > 140 ? 0.16 : 0.22
-        let minSepSq = minSep * minSep
-        let repulseStrength = count > 140 ? 0.042 : 0.068
-        for i in 0..<count {
-            let pi = nodes[i].position
-            let ci = nodes[i].clusterIndex
+        let localClearance = count > 180 ? 0.19 : 0.24
+        for i in nodes.indices {
+            let first = nodes[i]
             for j in (i + 1)..<count {
-                let d = pi - nodes[j].position
-                let distSq = d.lengthSq
-                let cutoffSq = (ci == nodes[j].clusterIndex) ? minSepSq : (minSepSq * 1.9)
-                if distSq < cutoffSq {
-                    let dist = max(sqrt(distSq), 0.008)
-                    let overlap = sqrt(cutoffSq) - dist
-                    let push = (overlap / dist) * repulseStrength * 14.0
-                    let f = d * push
-                    forces[i] += f
-                    forces[j] += f * -1.0
-                }
+                let second = nodes[j]
+                let sameCluster = first.clusterIndex == second.clusterIndex
+                let cutoff = sameCluster ? localClearance : 0.37
+                let delta = first.position - second.position
+                let distanceSquared = delta.lengthSq
+                guard distanceSquared < cutoff * cutoff else { continue }
+
+                let distance = sqrt(distanceSquared)
+                let direction = distance > 0.0001 ? delta * (1 / distance) : Vec3(x: 1, y: 0, z: 0)
+                let overlap = cutoff - distance
+                let strength = sameCluster ? 13.0 : 21.0
+                let push = direction * (overlap * strength * (1 + overlap / cutoff))
+                forces[i] += push
+                forces[j] += push * -1
             }
         }
 
         // 4. Integrate with elastic damping
-        let damping = pow(0.14, dt)
+        let damping = pow(0.035, dt)
         for i in 0..<count {
             if draggedNodeIndex == i {
                 nodes[i].velocity = .zero
@@ -491,8 +484,8 @@ private final class GalaxyEngine: ObservableObject {
 
             // Soft spherical boundary to keep universe cohesive
             let lenSq = nodes[i].position.lengthSq
-            if lenSq > 2.4 {
-                let inv = sqrt(2.4 / lenSq)
+            if lenSq > 4.0 {
+                let inv = sqrt(4.0 / lenSq)
                 nodes[i].position = nodes[i].position * inv
             }
         }
@@ -503,16 +496,18 @@ private final class GalaxyEngine: ObservableObject {
     func screenCenter(for size: CGSize, mode: MemoryGalaxyMode) -> CGPoint {
         switch mode {
         case .ambientBackdrop:
-            return CGPoint(x: size.width * 0.67, y: size.height * 0.44)
+            return CGPoint(x: size.width * 0.56, y: size.height * 0.48)
         case .interactiveFull:
             return CGPoint(x: size.width * 0.50, y: size.height * 0.50)
         }
     }
 
-    func baseScalePixels(for size: CGSize, mode: MemoryGalaxyMode) -> Double {
-        let minDim = Double(min(size.width, size.height))
-        let modeFactor = mode == .ambientBackdrop ? 0.40 : 0.42
-        return max(minDim * modeFactor, 160.0) * Double(effectiveScale)
+    private func projectionScale(for size: CGSize, mode: MemoryGalaxyMode) -> CGSize {
+        if mode == .ambientBackdrop {
+            return CGSize(width: size.width * 0.40 * effectiveScale, height: size.height * 0.39 * effectiveScale)
+        }
+        let uniform = max(min(size.width, size.height) * 0.40, 150) * effectiveScale
+        return CGSize(width: uniform, height: uniform)
     }
 
     func rotateToCamera(_ p: Vec3) -> Vec3 {
@@ -533,10 +528,10 @@ private final class GalaxyEngine: ObservableObject {
         let cameraDist = 3.25
         let denom = max(cameraDist - cam.z, 0.55)
         let persp = 2.65 / denom
-        let pxScale = baseScalePixels(for: size, mode: mode)
+        let scale = projectionScale(for: size, mode: mode)
         let center = screenCenter(for: size, mode: mode)
-        let sx = center.x + CGFloat(cam.x * persp * pxScale)
-        let sy = center.y - CGFloat(cam.y * persp * pxScale)
+        let sx = center.x + CGFloat(cam.x * persp) * scale.width
+        let sy = center.y - CGFloat(cam.y * persp) * scale.height
         return (CGPoint(x: sx, y: sy), cam.z, persp)
     }
 
@@ -544,9 +539,9 @@ private final class GalaxyEngine: ObservableObject {
     func worldDelta(forScreenDelta delta: CGSize, atDepth depth: Double, in size: CGSize, mode: MemoryGalaxyMode) -> Vec3 {
         let cameraDist = 3.25
         let persp = 2.65 / max(cameraDist - depth, 0.55)
-        let pxScale = max(baseScalePixels(for: size, mode: mode) * persp, 40.0)
-        let camDx = Double(delta.width) / pxScale
-        let camDy = -Double(delta.height) / pxScale
+        let scale = projectionScale(for: size, mode: mode)
+        let camDx = Double(delta.width) / max(scale.width * persp, 40)
+        let camDy = -Double(delta.height) / max(scale.height * persp, 40)
 
         // Inverse of rotateToCamera (transpose of Pitch * Yaw = Yaw^T * Pitch^T)
         let cosP = cos(pitch)
@@ -577,17 +572,19 @@ private final class GalaxyEngine: ObservableObject {
     }
 
     func resetView() {
-        yaw = 0.35
-        pitch = 0.22
+        yaw = Self.defaultYaw
+        pitch = Self.defaultPitch
         yawVelocity = 0
         pitchVelocity = 0
-        scale = 1.0
+        isSmoothResetting = false
         pinchMagnification = 1.0
+        setZoomScale(1.0)
     }
 
     func focusOn(nodeIDs: Set<String>) {
         let matched = nodes.filter { nodeIDs.contains($0.node.id) }
         guard !matched.isEmpty else { return }
+        markInteraction()
         var avg = Vec3.zero
         for m in matched { avg += m.position }
         avg = avg * (1.0 / Double(matched.count))
@@ -597,7 +594,7 @@ private final class GalaxyEngine: ObservableObject {
         pitch = targetPitch
         yawVelocity = 0
         pitchVelocity = 0
-        scale = matched.count == 1 ? 1.55 : 1.30
+        setZoomScale(matched.count == 1 ? 1.55 : 1.30)
     }
 
     private static func stableUnitHash(_ value: String) -> Double {
@@ -624,8 +621,11 @@ struct MemoryGalaxyView: View {
     @Environment(\.theme) private var theme
     @ObservedObject var model: AppModel
     var mode: MemoryGalaxyMode = .interactiveFull
+    var isPaused: Bool = false
+    var isSidebarExpanded: Bool = false
     var dreamResonanceTrigger: Date? = nil
     let onSelectMemoryID: (String) -> Void
+    var onClearSelection: (() -> Void)? = nil
 
     @StateObject private var engine = GalaxyEngine()
 
@@ -671,7 +671,7 @@ struct MemoryGalaxyView: View {
         GeometryReader { proxy in
             let size = proxy.size
             ZStack {
-                TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
+                TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: isPaused)) { timeline in
                     galaxyCanvas(size: size, now: timeline.date)
                 }
 
@@ -700,9 +700,86 @@ struct MemoryGalaxyView: View {
             .onChange(of: mode) { _, newMode in
                 engine.lastMode = newMode
             }
+            .onChange(of: isPaused) { _, paused in
+                if !paused {
+                    engine.lastTickDate = nil
+                }
+            }
             .onChange(of: model.memoryGraph) { _, newGraph in
                 engine.syncGraph(newGraph)
             }
+        }
+    }
+
+    // The camera can project distant stars onto the same point despite their world-space separation.
+    private func separateProjectedStars(_ stars: inout [ProjectedStar], pinnedIndex: Int?) {
+        guard stars.count > 1 else { return }
+        let origins = stars.map(\.screen)
+        for _ in 0..<3 {
+            let cells = stars.map { ProjectionCell(point: $0.screen) }
+            let buckets = Dictionary(grouping: stars.indices) { cells[$0] }
+            var moved = false
+            for first in stars.indices {
+                let cell = cells[first]
+                for row in (cell.row - 1)...(cell.row + 1) {
+                    for column in (cell.column - 1)...(cell.column + 1) {
+                        for second in buckets[ProjectionCell(column: column, row: row)] ?? [] where second > first {
+                            let a = stars[first]
+                            let b = stars[second]
+                            let dx = a.screen.x - b.screen.x
+                            let dy = a.screen.y - b.screen.y
+                            let distance = hypot(dx, dy)
+                            let clearance = a.radius + b.radius + 2.2
+                            guard distance < clearance else { continue }
+
+                            let direction = distance > 0.01 ? CGPoint(x: dx / distance, y: dy / distance) : CGPoint(x: 1, y: 0)
+                            let overlap = clearance - distance
+                            let share: CGFloat
+                            if a.index == pinnedIndex {
+                                share = 0
+                            } else if b.index == pinnedIndex {
+                                share = 1
+                            } else {
+                                share = b.radius / (a.radius + b.radius)
+                            }
+                            stars[first].screen = projectedOffset(a.screen, origin: origins[first], direction: direction, distance: overlap * share)
+                            stars[second].screen = projectedOffset(b.screen, origin: origins[second], direction: direction, distance: -overlap * (1 - share))
+                            moved = true
+                        }
+                    }
+                }
+            }
+            if !moved { break }
+        }
+    }
+
+    private func projectedOffset(_ point: CGPoint, origin: CGPoint, direction: CGPoint, distance: CGFloat) -> CGPoint {
+        let x = point.x + direction.x * distance - origin.x
+        let y = point.y + direction.y * distance - origin.y
+        let limit = min(1, 18 / max(hypot(x, y), 1))
+        return CGPoint(x: origin.x + x * limit, y: origin.y + y * limit)
+    }
+
+    private func drawGalaxyLabels(
+        in context: GraphicsContext,
+        size: CGSize,
+        clouds: [GalaxyCloud],
+        palette: [Color]
+    ) {
+        let viewport = CGRect(x: -40, y: 24, width: size.width + 80, height: max(0, size.height - 44))
+        for cloud in clouds where cloud.bounds.intersects(viewport) {
+            let label = cloud.meta.label
+            let title = label.count > 24 ? String(label.prefix(23)) + "…" : label
+            let baseColor = palette[cloud.meta.colorIndex % palette.count]
+            let depthAlpha = min(max((cloud.avgDepth + 1.55) / 2.85, 0.44), 0.94)
+            let anchorY = max(32, min(size.height - 22, cloud.bounds.minY - 11))
+            let anchorX = min(max(cloud.centroid.x, 36), max(size.width - 36, 36))
+            let text = context.resolve(
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(baseColor.opacity(depthAlpha))
+            )
+            context.draw(text, at: CGPoint(x: anchorX, y: anchorY), anchor: .center)
         }
     }
 
@@ -732,16 +809,13 @@ struct MemoryGalaxyView: View {
             : nil
 
         // Visible node indices & projection
-        var visibleIndexSet = Set<Int>()
         var projected: [ProjectedStar] = []
         projected.reserveCapacity(engine.nodes.count)
 
         for (idx, item) in engine.nodes.enumerated() {
             guard isNodeVisible(item.node) else { continue }
-            visibleIndexSet.insert(idx)
             let proj = engine.project(item.position, in: size, mode: mode)
-            let heatBoost = min(Double(item.node.hitCount) * 0.72 + Double(item.node.evidenceCount) * 0.32, 5.5)
-            let baseR = CGFloat((4.0 + heatBoost) * min(max(proj.perspective, 0.58), 1.55))
+            let baseR = CGFloat((2.05 + item.prominence * 4.7) * min(max(proj.perspective, 0.72), 1.25))
             projected.append(ProjectedStar(
                 index: idx,
                 node: item.node,
@@ -752,6 +826,7 @@ struct MemoryGalaxyView: View {
                 radius: baseR
             ))
         }
+        separateProjectedStars(&projected, pinnedIndex: engine.draggedNodeIndex ?? focusID.flatMap { engine.idToIndex[$0] })
         projected.sort { $0.depth < $1.depth }
         engine.lastProjected = projected
 
@@ -790,9 +865,7 @@ struct MemoryGalaxyView: View {
 
             // Subtle atmospheric radial glow behind the galaxy center
             let ambientRadius = max(canvasSize.width, canvasSize.height) * 0.58
-            let ambientColor = theme.isDark
-                ? Color(red: 36 / 255, green: 62 / 255, blue: 112 / 255).opacity(0.18)
-                : Color(red: 147 / 255, green: 197 / 255, blue: 253 / 255).opacity(0.20)
+            let ambientColor = theme.galaxyAtmosphere.opacity(theme.isDark ? 0.18 : 0.20)
             context.fill(
                 Path(bgRect),
                 with: .radialGradient(
@@ -821,48 +894,35 @@ struct MemoryGalaxyView: View {
             }
 
             // 3. Dynamic 3D Nebula Clouds per Cluster (computed live from projected centroids & spread)
-            struct ClusterCloud {
-                let clusterIndex: Int
-                let meta: GalaxyClusterMeta
-                let centroid: CGPoint
-                let spread: CGFloat
-                let avgDepth: Double
-                let avgPerspective: Double
-                let hasPulse: Bool
-            }
-
-            var clouds: [ClusterCloud] = []
-            for (cIdx, meta) in engine.clusters.enumerated() {
-                let members = projected.filter { $0.clusterIndex == cIdx }
-                guard !members.isEmpty else { continue }
+            var clouds: [GalaxyCloud] = []
+            let clusterMembers = Dictionary(grouping: projected, by: \.clusterIndex)
+            for (index, meta) in engine.clusters.enumerated() {
+                guard let members = clusterMembers[index], !members.isEmpty else { continue }
                 var sumX: CGFloat = 0
                 var sumY: CGFloat = 0
                 var sumDepth: Double = 0
-                var sumPersp: Double = 0
-                var hasPulse = false
-                for m in members {
-                    sumX += m.screen.x
-                    sumY += m.screen.y
-                    sumDepth += m.depth
-                    sumPersp += m.perspective
-                    if pulseProgress != nil && pulseIDs.contains(m.node.id) {
-                        hasPulse = true
-                    }
+                var sumPerspective: Double = 0
+                var bounds = CGRect.null
+                for star in members {
+                    sumX += star.screen.x
+                    sumY += star.screen.y
+                    sumDepth += star.depth
+                    sumPerspective += star.perspective
+                    let extent = star.radius + 5
+                    bounds = bounds.union(CGRect(
+                        x: star.screen.x - extent, y: star.screen.y - extent,
+                        width: extent * 2, height: extent * 2
+                    ))
                 }
-                let inv = CGFloat(1.0 / Double(members.count))
-                let centroid = CGPoint(x: sumX * inv, y: sumY * inv)
-                var maxDist: CGFloat = 46
-                for m in members {
-                    maxDist = max(maxDist, hypot(m.screen.x - centroid.x, m.screen.y - centroid.y))
+                let count = Double(members.count)
+                let centroid = CGPoint(x: sumX / count, y: sumY / count)
+                let spread = members.reduce(CGFloat(42)) {
+                    max($0, hypot($1.screen.x - centroid.x, $1.screen.y - centroid.y))
                 }
-                clouds.append(ClusterCloud(
-                    clusterIndex: cIdx,
-                    meta: meta,
-                    centroid: centroid,
-                    spread: maxDist,
-                    avgDepth: sumDepth / Double(members.count),
-                    avgPerspective: sumPersp / Double(members.count),
-                    hasPulse: hasPulse
+                clouds.append(GalaxyCloud(
+                    meta: meta, centroid: centroid, spread: spread, bounds: bounds, memberCount: members.count,
+                    avgDepth: sumDepth / count, avgPerspective: sumPerspective / count,
+                    hasPulse: pulseProgress != nil && members.contains { pulseIDs.contains($0.node.id) }
                 ))
             }
             clouds.sort { $0.avgDepth < $1.avgDepth }
@@ -918,16 +978,6 @@ struct MemoryGalaxyView: View {
                         endRadius: innerR
                     )
                 )
-
-                // Subtle cluster label floating near the top rim of the nebula
-                let labelAlpha = (theme.isDark ? 0.46 : 0.56) * depthFactor
-                let resolved = context.resolve(
-                    Text(cloud.meta.label)
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(baseColor.opacity(min(labelAlpha, 0.85)))
-                )
-                let labelY = cloud.centroid.y - min(cloud.spread * 0.78 + 18, outerR * 0.62)
-                context.draw(resolved, at: CGPoint(x: cloud.centroid.x, y: labelY), anchor: .center)
             }
 
             // 4. Dream Resonance Cosmic Wavefront (triggered by "批量做梦" pill)
@@ -957,7 +1007,6 @@ struct MemoryGalaxyView: View {
 
             // 5. Curved Depth-Modulated Edges
             for edge in engine.edges {
-                guard visibleIndexSet.contains(edge.sourceIndex), visibleIndexSet.contains(edge.targetIndex) else { continue }
                 if mode == .interactiveFull {
                     switch edge.kind {
                     case .semantic: if !engine.showSemanticEdges { continue }
@@ -970,6 +1019,7 @@ struct MemoryGalaxyView: View {
                 let avgDepth = (s1.depth + s2.depth) * 0.5
                 let depthAlpha = min(max((avgDepth + 1.5) / 2.8, 0.22), 1.0)
                 let touchesFocus = focusID != nil && (s1.node.id == focusID || s2.node.id == focusID)
+                guard edge.sameCluster || touchesFocus else { continue }
                 let dimmed = (focusID != nil && !touchesFocus) || (hasSearch && !matches.contains(s1.node.id) && !matches.contains(s2.node.id))
 
                 // Gentle quadratic arc
@@ -986,20 +1036,17 @@ struct MemoryGalaxyView: View {
 
                 switch edge.kind {
                 case .semantic:
-                    let baseAlpha = min(max(0.16 + edge.weight * 0.40, 0.16), 0.62) * depthAlpha
+                    let baseAlpha = (0.14 + edge.weight * 0.28) * depthAlpha
                     if edge.sameCluster {
                         let color = touchesFocus
                             ? theme.accent.opacity(0.85)
                             : theme.galaxyEdge.opacity(dimmed ? 0.10 : baseAlpha)
                         context.stroke(path, with: .color(color), lineWidth: touchesFocus ? 1.65 : 1.0)
                     } else {
-                        let color = touchesFocus
-                            ? theme.accent.opacity(0.75)
-                            : theme.galaxyEdge.opacity(dimmed ? 0.08 : baseAlpha * 0.65)
                         context.stroke(
                             path,
-                            with: .color(color),
-                            style: StrokeStyle(lineWidth: touchesFocus ? 1.4 : 0.85, dash: [2.5, 4.5])
+                            with: .color(theme.accent.opacity(0.75)),
+                            style: StrokeStyle(lineWidth: 1.4, dash: [2.5, 4.5])
                         )
                     }
                 case .duplicate:
@@ -1033,7 +1080,9 @@ struct MemoryGalaxyView: View {
                 let starColor = nebulaPalette[clusterMeta.colorIndex % nebulaPalette.count]
                 let depthFactor = min(max((star.depth + 1.55) / 2.85, 0.30), 1.0)
 
-                var alpha = (star.node.isDormant ? 0.36 : (0.54 + 0.46 * min(max(star.node.freshness, 0), 1))) * depthFactor
+                let freshness = min(max(star.node.freshness, 0), 1)
+                let visibility = star.node.isDormant ? 0.39 : 0.70 + 0.30 * freshness
+                var alpha = visibility * (0.50 + 0.50 * depthFactor)
                 if hasSearch && !isMatch { alpha *= 0.20 }
                 else if !isNeighbor && !isMatch { alpha *= 0.26 }
                 if isHovered || isSelected || isMatch || isPulsing { alpha = 1.0 }
@@ -1073,8 +1122,8 @@ struct MemoryGalaxyView: View {
                     Path(ellipseIn: auraRect),
                     with: .radialGradient(
                         Gradient(stops: [
-                            .init(color: starColor.opacity(min(alpha * (theme.isDark ? 0.58 : 0.42) + resonanceFlare * 0.35, 0.92)), location: 0.0),
-                            .init(color: starColor.opacity(alpha * (theme.isDark ? 0.22 : 0.14)), location: 0.42),
+                            .init(color: starColor.opacity(min(alpha * (theme.isDark ? 0.46 : 0.36) + resonanceFlare * 0.35, 0.86)), location: 0.0),
+                            .init(color: starColor.opacity(alpha * (theme.isDark ? 0.16 : 0.14)), location: 0.42),
                             .init(color: Color.clear, location: 1.0)
                         ]),
                         center: p,
@@ -1083,24 +1132,50 @@ struct MemoryGalaxyView: View {
                     )
                 )
 
-                // Bright luminous star core
+                // Dimensional luminous core (dark: radiant core + gleam; light: translucent gemstone orb with top-left specular)
                 let coreRect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
-                let coreCenterColor = theme.isDark
-                    ? Color.white.opacity(min(alpha * 0.95 + resonanceFlare * 0.2, 1.0))
-                    : Color.white.opacity(0.92)
-                context.fill(
-                    Path(ellipseIn: coreRect),
-                    with: .radialGradient(
-                        Gradient(stops: [
-                            .init(color: coreCenterColor, location: 0.0),
-                            .init(color: starColor.opacity(min(alpha, 1.0)), location: 0.55),
-                            .init(color: starColor.opacity(alpha * 0.55), location: 1.0)
-                        ]),
-                        center: p,
-                        startRadius: 0,
-                        endRadius: r
+                let core = Path(ellipseIn: coreRect)
+                if theme.isDark {
+                    context.fill(core, with: .color(starColor.opacity(min(alpha * 1.12, 1))))
+                    context.fill(
+                        core,
+                        with: .radialGradient(
+                            Gradient(colors: [theme.galaxyStarGleam.opacity(alpha * 0.68), .clear]),
+                            center: p,
+                            startRadius: 0,
+                            endRadius: r
+                        )
                     )
-                )
+                } else {
+                    let highlightCenter = CGPoint(x: p.x - r * 0.28, y: p.y - r * 0.28)
+                    context.fill(
+                        core,
+                        with: .radialGradient(
+                            Gradient(stops: [
+                                .init(color: theme.galaxyStarGleam.opacity(min(alpha * 0.96, 1.0)), location: 0.0),
+                                .init(color: starColor.opacity(min(alpha * 0.68, 0.92)), location: 0.30),
+                                .init(color: starColor.opacity(min(alpha * 0.96, 1.0)), location: 0.72),
+                                .init(color: starColor.opacity(min(alpha * 1.08, 1.0)), location: 1.0)
+                            ]),
+                            center: highlightCenter,
+                            startRadius: 0,
+                            endRadius: r * 1.38
+                        )
+                    )
+                    // Crisp subtle top-left specular pinpoint
+                    let specR = max(r * 0.28, 0.95)
+                    let specCenter = CGPoint(x: p.x - r * 0.30, y: p.y - r * 0.30)
+                    let specRect = CGRect(x: specCenter.x - specR, y: specCenter.y - specR, width: specR * 2, height: specR * 2)
+                    context.fill(
+                        Path(ellipseIn: specRect),
+                        with: .radialGradient(
+                            Gradient(colors: [Color.white.opacity(min(alpha * 0.92, 0.95)), Color.clear]),
+                            center: specCenter,
+                            startRadius: 0,
+                            endRadius: specR
+                        )
+                    )
+                }
 
                 // Selection / match / dormant subtle ring
                 if isSelected || isHovered || isMatch {
@@ -1141,11 +1216,14 @@ struct MemoryGalaxyView: View {
                     }
                 }
             }
+
+            drawGalaxyLabels(in: context, size: canvasSize, clouds: clouds, palette: nebulaPalette)
         }
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: 2)
                 .onChanged { value in
+                    engine.markInteraction()
                     if engine.lastDragLocation == nil {
                         if let grabbed = engine.hitTestProjected(at: value.startLocation) {
                             engine.draggedNodeIndex = grabbed.index
@@ -1180,6 +1258,7 @@ struct MemoryGalaxyView: View {
                     }
                 }
                 .onEnded { _ in
+                    engine.markInteraction()
                     engine.draggedNodeIndex = nil
                     engine.isDraggingSpace = false
                     engine.lastDragLocation = nil
@@ -1188,11 +1267,26 @@ struct MemoryGalaxyView: View {
         .simultaneousGesture(
             MagnificationGesture()
                 .onChanged { value in
+                    engine.markInteraction()
                     engine.pinchMagnification = value
+                    let pct = Int((engine.effectiveScale * 100).rounded())
+                    if engine.displayedZoomPercent != pct {
+                        engine.displayedZoomPercent = pct
+                    }
                 }
                 .onEnded { value in
-                    engine.scale = min(max(engine.scale * value, 0.55), 2.8)
+                    engine.markInteraction()
                     engine.pinchMagnification = 1.0
+                    engine.setZoomScale(engine.zoomScale * Double(value))
+                }
+        )
+        .simultaneousGesture(
+            SpatialTapGesture(count: 2)
+                .onEnded { value in
+                    guard mode == .interactiveFull else { return }
+                    if engine.hitTestProjected(at: value.location) == nil {
+                        engine.beginSmoothReset()
+                    }
                 }
         )
         .simultaneousGesture(
@@ -1200,6 +1294,8 @@ struct MemoryGalaxyView: View {
                 .onEnded { value in
                     if let hitStar = engine.hitTestProjected(at: value.location) {
                         onSelectMemoryID(hitStar.node.id)
+                    } else {
+                        onClearSelection?()
                     }
                 }
         )
@@ -1305,6 +1401,20 @@ struct MemoryGalaxyView: View {
             .padding(.trailing, 18)
             .padding(.top, 98)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .rotation3DEffect(
+                .degrees(isSidebarExpanded ? -7 : 0),
+                axis: (x: 0, y: 1, z: 0),
+                anchor: .trailing,
+                perspective: 0.45
+            )
+            .offset(x: isSidebarExpanded ? 16 : 0)
+            .scaleEffect(isSidebarExpanded ? 0.95 : 1.0, anchor: .trailing)
+            .animation(
+                isSidebarExpanded
+                    ? .spring(response: 0.32, dampingFraction: 0.82)
+                    : .easeOut(duration: 0.22),
+                value: isSidebarExpanded
+            )
 
             // Empty state when no nodes exist
             if model.memoryGraph.nodes.isEmpty {
@@ -1348,8 +1458,8 @@ struct MemoryGalaxyView: View {
                     legendDot("项目星系", color: theme.scopeProject)
                     legendLine("疑似重复", color: theme.warning, dashed: true)
                     legendLine("同源证据", color: theme.info, dashed: true)
-                    Text("· 拖空白旋转 · 抓星点拉扯")
-                        .font(.caption2)
+                    Text("· 拖空白旋转 · 抓星点拉扯 · 双击回中")
+                        .font(.system(size: 11.5))
                         .foregroundStyle(theme.textTertiary)
                 }
                 .padding(.horizontal, 11)
@@ -1360,6 +1470,20 @@ struct MemoryGalaxyView: View {
             .padding(.bottom, 18)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             .allowsHitTesting(false)
+            .rotation3DEffect(
+                .degrees(isSidebarExpanded ? -7 : 0),
+                axis: (x: 0, y: 1, z: 0),
+                anchor: .trailing,
+                perspective: 0.45
+            )
+            .offset(x: isSidebarExpanded ? 16 : 0)
+            .scaleEffect(isSidebarExpanded ? 0.95 : 1.0, anchor: .trailing)
+            .animation(
+                isSidebarExpanded
+                    ? .spring(response: 0.32, dampingFraction: 0.82)
+                    : .easeOut(duration: 0.22),
+                value: isSidebarExpanded
+            )
 
             // Bottom-right zoom / auto-rotate / reset capsule
             HStack(spacing: 4) {
@@ -1376,9 +1500,8 @@ struct MemoryGalaxyView: View {
                 Divider().frame(height: 14).overlay(theme.hairlineBorder)
 
                 Button {
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        engine.scale = max(engine.scale / 1.25, 0.55)
-                    }
+                    engine.markInteraction()
+                    engine.setZoomScale(engine.zoomScale / 1.25)
                 } label: {
                     Image(systemName: "minus")
                         .frame(width: 24, height: 24)
@@ -1386,16 +1509,15 @@ struct MemoryGalaxyView: View {
                 .buttonStyle(.plain)
                 .help("缩小")
 
-                Text("\(Int((engine.effectiveScale * 100).rounded()))%")
-                    .font(.caption2.weight(.semibold))
+                Text("\(engine.displayedZoomPercent)%")
+                    .font(.system(size: 11.5, weight: .semibold))
                     .monospacedDigit()
                     .foregroundStyle(theme.textSecondary)
-                    .frame(width: 40)
+                    .frame(width: 42)
 
                 Button {
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        engine.scale = min(engine.scale * 1.25, 2.8)
-                    }
+                    engine.markInteraction()
+                    engine.setZoomScale(engine.zoomScale * 1.25)
                 } label: {
                     Image(systemName: "plus")
                         .frame(width: 24, height: 24)
@@ -1406,15 +1528,13 @@ struct MemoryGalaxyView: View {
                 Divider().frame(height: 14).overlay(theme.hairlineBorder)
 
                 Button {
-                    withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
-                        engine.resetView()
-                    }
+                    engine.beginSmoothReset()
                 } label: {
                     Image(systemName: "arrow.counterclockwise")
                         .frame(width: 24, height: 24)
                 }
                 .buttonStyle(.plain)
-                .help("重置 3D 视角")
+                .help("平滑回中并重置视角")
             }
             .foregroundStyle(theme.textPrimary)
             .padding(.horizontal, 8)

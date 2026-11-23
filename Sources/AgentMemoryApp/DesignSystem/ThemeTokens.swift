@@ -313,14 +313,32 @@ struct ThemePalette: Equatable {
             ]
         } else {
             return [
-                Color(red: 109 / 255, green: 40 / 255, blue: 217 / 255),  // Violet (Global)
-                Color(red: 13 / 255, green: 148 / 255, blue: 136 / 255),  // Teal
-                Color(red: 2 / 255, green: 132 / 255, blue: 199 / 255),   // Sky
-                Color(red: 79 / 255, green: 70 / 255, blue: 229 / 255),   // Indigo
-                Color(red: 5 / 255, green: 150 / 255, blue: 105 / 255),   // Emerald
-                Color(red: 219 / 255, green: 39 / 255, blue: 119 / 255)   // Nebula Rose
+                Color(red: 108 / 255, green: 73 / 255, blue: 164 / 255),
+                Color(red: 24 / 255, green: 117 / 255, blue: 110 / 255),
+                Color(red: 38 / 255, green: 111 / 255, blue: 159 / 255),
+                Color(red: 75 / 255, green: 83 / 255, blue: 155 / 255),
+                Color(red: 39 / 255, green: 118 / 255, blue: 85 / 255),
+                Color(red: 161 / 255, green: 65 / 255, blue: 111 / 255)
             ]
         }
+    }
+
+    var galaxyAtmosphere: Color {
+        isDark
+            ? Color(red: 36 / 255, green: 62 / 255, blue: 112 / 255)
+            : Color(red: 147 / 255, green: 197 / 255, blue: 253 / 255)
+    }
+
+    var galaxyLabelFill: Color {
+        isDark ? galaxyBackground.opacity(0.76) : Color.white.opacity(0.78)
+    }
+
+    var galaxyLabelBorder: Color {
+        textPrimary.opacity(isDark ? 0.20 : 0.15)
+    }
+
+    var galaxyStarGleam: Color {
+        Color(red: 0.94, green: 0.97, blue: 1)
     }
 
     var galaxyGrid: Color {

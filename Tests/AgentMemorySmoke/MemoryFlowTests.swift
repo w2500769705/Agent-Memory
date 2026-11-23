@@ -12,6 +12,7 @@ struct MemoryFlowTests {
         tests.testCodexEvidenceUsesFinalOutputAndSkipsDreams()
         try tests.testCodexScanCheckpointAndDeduplication()
         try tests.testMCPWritesViaSocket()
+        try tests.testDreamSubmissionValidationAndRelease()
         try tests.testBulkDreamSnapshot()
         try tests.testLargeMCPBatch()
         try tests.testGuidedRecall()
@@ -19,15 +20,23 @@ struct MemoryFlowTests {
         try tests.testAntigravityRecallAndCapture()
         try tests.testSmartCaptureAndIncrementalRead()
         try tests.testRecallVersionsAndActivityLog()
+        try tests.testMemoryBatchLookup()
         try tests.testRecallIgnoresGenericQuestionsAndFindsSpecificMemories()
         try tests.testRecallVectorThresholdsAndKeywordFallback()
         try tests.testRecallDoesNotBackfillAfterDeduplication()
         try tests.testLegacyMemoryStatisticsMigration()
         try tests.testVectorCacheInspectionAndMemoryHealth()
+        try tests.testManualMemoryArchiveAndRestore()
+        try tests.testArchivedMemoryQuery()
+        try tests.testPermanentArchiveDeletion()
+        try tests.testBulkArchiveAndDeletion()
         try tests.testDreamBatchSummariesAndLookups()
         try tests.testMemoryGraph()
         try tests.testCrossAgentMemoryPulses()
-        print("通过 21 项冒烟测试")
+        try tests.testProjectMigrationMovesLiveDataAndPreservesSnapshots()
+        try tests.testProjectMigrationProtectsClaimedBatches()
+        try tests.testProjectMigrationCLI()
+        print("通过 30 项冒烟测试")
     }
 
     let project = "/tmp/agent-memory-demo"
@@ -40,6 +49,20 @@ struct MemoryFlowTests {
     private func add(_ evidence: Evidence, title: String, body: String) -> Proposal {
         .init(operation: .add, evidenceIDs: [evidence.id], reason: "用户已确认",
               scope: "project", project: evidence.project, title: title, body: body)
+    }
+
+    private struct MCPSubmission: Decodable {
+        let status: String
+        let batchID: String
+        let decisions: [Decision]
+        let message: String
+    }
+
+    private func submitViaMCP(_ batch: DreamBatch, proposals: [Proposal], store: MemoryStore) throws -> MCPSubmission {
+        struct Arguments: Encodable { let batchID: String; let proposals: [Proposal] }
+        struct Request: Encodable { let name: String; let arguments: Arguments }
+        let request = Request(name: "dream_submit", arguments: .init(batchID: batch.id, proposals: proposals))
+        return try Wire.decode(MCPSubmission.self, MCPTools.handle(Wire.data(request), store: store))
     }
 
     func testCaptureSubmitSemanticRetrievalAndUndo() throws {
@@ -90,8 +113,10 @@ struct MemoryFlowTests {
                   project: project, title: target.title, body: body, memoryID: target.id, expectedVersion: target.version)
         }
         _ = try store.submit(batchID: first.id, proposals: [edit(updates[0], body: "签名 APK 版本 2")])
-        let conflicting = try store.submit(batchID: second.id, proposals: [edit(updates[1], body: "签名 APK 版本 3")])
+        let conflicting = try submitViaMCP(second, proposals: [edit(updates[1], body: "签名 APK 版本 3")], store: store)
+        expectEqual(conflicting.status, "submitted")
         expectEqual(conflicting.decisions.first?.status, "conflict")
+        expectTrue(conflicting.message.contains("停止领取"))
         expectEqual(try store.search("APK").first?.memory.body, "签名 APK 版本 2")
         expectEqual(try store.getBatch()?.evidence.map(\.id), [updates[1].id])
         expectError(try store.undo(initial.id))
@@ -119,6 +144,26 @@ struct MemoryFlowTests {
         expectError(try store.getBatch(batchID: pending.id))
         expectError(try store.submit(batchID: pending.id, proposals: [add(excluded, title: "发布", body: "项目记录")]))
         expectEqual(try store.ingest([excluded]), 0)
+
+        let parent = proof(4, text: "在父项目验证了签名发布。")
+        let child = proof(5, text: "在子项目验证了首页渲染。", project: project + "/child")
+        try store.ingest([parent, child])
+        let mixed = try unwrap(store.getBatch())
+        expectEqual(mixed.evidence.map(\.project), [parent.project, child.project])
+        let memoryCount = try store.dashboard().memories
+        let parentProposal = add(parent, title: "签名发布", body: "父项目发布包使用固定签名。")
+        let mixedProposal = Proposal(operation: .add, evidenceIDs: [parent.id, child.id], reason: "合并证据",
+                                     scope: "project", project: parent.project, title: "合并规则", body: "合并两个项目的规则。")
+        do {
+            _ = try store.submit(batchID: mixed.id, proposals: [parentProposal, mixedProposal])
+            fatalError("跨项目证据应导致整批提交失败")
+        } catch let error as MemoryError {
+            expectEqual(error.errorDescription, "第 2 条提案：项目记忆只能引用同项目证据。")
+        }
+        expectEqual(try store.dashboard().memories, memoryCount)
+        let childProposal = add(child, title: "首页渲染", body: "子项目验收时检查首页渲染。")
+        let corrected = try store.submit(batchID: mixed.id, proposals: [parentProposal, childProposal])
+        expectEqual(corrected.decisions.map(\.status), ["applied", "applied"])
     }
 
     func testCodexEvidenceUsesFinalOutputAndSkipsDreams() {
@@ -192,6 +237,89 @@ struct MemoryFlowTests {
         }
     }
 
+    func testDreamSubmissionValidationAndRelease() throws {
+        let directory = URL(fileURLWithPath: "/tmp/am-" + String(UUID().uuidString.prefix(10)))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let socket = directory.appendingPathComponent("mcp.sock")
+        let store = try MemoryStore(path: ":memory:")
+        let server = try LocalToolServer(store: store, path: socket)
+
+        try withExtendedLifetime(server) {
+            func call(_ tool: String, arguments: [String: Any] = [:]) throws -> Data {
+                let request = try JSONSerialization.data(withJSONObject: ["name": tool, "arguments": arguments])
+                return try LocalConnection.call(request, socket: socket)
+            }
+            func toolError(_ result: Data) throws -> String {
+                try unwrap(Wire.decode([String: String].self, result)["toolError"])
+            }
+
+            let older = proof(1, text: "之前批次已处理的旧记录")
+            let current = [proof(2, text: "发布包签名要求"), proof(3, text: "临时测试信息")]
+            try store.ingest([older] + current)
+            let previousBatch = try unwrap(store.getBatch(limit: 1))
+            _ = try store.submit(batchID: previousBatch.id, proposals: [
+                Proposal(operation: .skip, evidenceIDs: [older.id], reason: "临时记录")
+            ])
+            let batch = try Wire.decode(DreamBatch.self, call("dream_get_batch"))
+            let submit = "dream_submit"
+            let missing = try toolError(call(submit, arguments: ["batchID": batch.id, "proposals": [
+                ["operation": "skip"], ["operation": "skip", "evidenceIDs": NSNull()]
+            ]]))
+            expectTrue(missing.contains("第 1 条提案缺少必填字段：evidenceIDs、reason"))
+            expectTrue(missing.contains("第 2 条提案缺少必填字段：evidenceIDs、reason"))
+            let missingByOperation = try toolError(call(submit, arguments: ["batchID": batch.id, "proposals": [
+                ["operation": "skip", "evidenceIDs": [current[0].id], "reason": "临时记录"],
+                ["operation": "update", "evidenceIDs": [current[1].id], "reason": "用户已确认",
+                 "body": "发布包使用项目签名", "memoryID": "test-memory", "expectedVersion": 1],
+                ["operation": "add", "evidenceIDs": [current[1].id], "reason": "用户已确认",
+                 "title": "发布包签名", "body": " ", "scope": "project", "project": NSNull()],
+                ["operation": "archive", "evidenceIDs": [current[1].id], "reason": "已过期"],
+                ["operation": "add", "evidenceIDs": [current[1].id], "reason": "用户已确认",
+                 "title": "通用签名要求", "scope": "global"]
+            ]]))
+            expectEqual(missingByOperation, [
+                "第 2 条提案缺少必填字段：title、scope（项目范围还需提供 project）",
+                "第 3 条提案缺少必填字段：body、project",
+                "第 4 条提案缺少必填字段：memoryID、expectedVersion",
+                "第 5 条提案缺少必填字段：body"
+            ].joined(separator: "。") + "。")
+            let invalidType = try toolError(call(submit, arguments: ["batchID": batch.id, "proposals": [
+                ["operation": "skip", "evidenceIDs": current[0].id, "reason": "临时记录"]
+            ]]))
+            expectTrue(invalidType.contains("arguments.proposals[0].evidenceIDs"))
+            let wrongEvidence = try toolError(call(submit, arguments: ["batchID": batch.id, "proposals": [
+                ["operation": "skip", "evidenceIDs": [current[0].id], "reason": "临时记录"],
+                ["operation": "skip", "evidenceIDs": [older.id], "reason": "临时记录"]
+            ]]))
+            expectTrue(wrongEvidence.contains("第 2 条提案：evidenceIDs 第 1 项不属于当前批次"))
+            expectFalse(try store.dashboard().batches.contains(batch.id))
+            expectNil(try store.dashboard().queuedThrough)
+
+            struct Release: Decodable { let batchID: String; let releasedCount: Int }
+            func release(_ batchID: String) throws -> Release {
+                try Wire.decode(Release.self, call("dream_release_batch", arguments: ["batchID": batchID]))
+            }
+            let released = try release(batch.id)
+            expectEqual(released.batchID, batch.id)
+            expectEqual(released.releasedCount, 2)
+            let reclaimed = try Wire.decode(DreamBatch.self, call("dream_get_batch"))
+            expectTrue(reclaimed.id != batch.id)
+            expectEqual(reclaimed.evidence.map(\.id), current.map(\.id))
+            expectEqual(try release(batch.id).releasedCount, 0)
+            let result = try Wire.decode(Submission.self, call(submit, arguments: [
+                "batchID": reclaimed.id,
+                "proposals": [["operation": "skip", "evidenceIDs": current.map(\.id), "reason": "测试记录"]]
+            ]))
+            expectEqual(result.decisions.first?.status, "skipped")
+            let submittedBatch = try toolError(call("dream_release_batch", arguments: ["batchID": reclaimed.id]))
+            expectEqual(submittedBatch, "批次已提交，无法退回队列。")
+            expectTrue(try store.dashboard().batches.contains(reclaimed.id))
+            expectEqual(try store.dashboard().pending, 0)
+        }
+    }
+
     func testBulkDreamSnapshot() throws {
         let store = try MemoryStore(path: ":memory:")
         expectNil(try store.dashboard().queuedThrough)
@@ -204,6 +332,13 @@ struct MemoryFlowTests {
         expectEqual(components.path, "/new")
         let prompt = try unwrap(components.queryItems?.first(where: { $0.name == "prompt" })?.value)
         expectTrue(prompt.contains("through: \(through)"))
+        for guidance in ["原始 project 路径分组", "完全一致", "路径有父子关系", "全局记忆必须有明确的跨项目适用依据"] {
+            expectTrue(prompt.contains(guidance))
+            expectTrue(MCPTools.instructions.contains(guidance))
+        }
+        expectTrue(prompt.contains("review 项计入待确认"))
+        expectTrue(prompt.contains("批次没有 conflict 时继续领取下一批"))
+        expectTrue(prompt.contains("提交前逐项对照 evidenceIDs 与证据的 project"))
         let turn: [String: Any] = [
             "status": "completed", "id": "bulk-dream", "items": [
                 ["type": "userMessage", "content": [["type": "text", "text": prompt]]]
@@ -221,13 +356,51 @@ struct MemoryFlowTests {
             let batch = try Wire.decode(DreamBatch.self, MCPTools.handle(claim, store: store))
             expectEqual(batch.evidence.count, expected)
             expectFalse(batch.evidence.contains { $0.id == later.id })
-            _ = try store.submit(batchID: batch.id, proposals: [
-                Proposal(operation: .skip, evidenceIDs: batch.evidence.map(\.id), reason: "临时测试记录")
-            ])
+            var skipEvidence = batch.evidence
+            var proposals: [Proposal] = []
+            if expected == 8 {
+                let global = skipEvidence.removeFirst()
+                let projectEvidence = skipEvidence.removeFirst()
+                proposals = [
+                    add(projectEvidence, title: "项目检查流程", body: "发布包先检查版本。"),
+                    Proposal(operation: .add, evidenceIDs: [global.id], reason: "适用于所有项目",
+                             scope: "global", title: "全局沟通偏好", body: "先说明操作结果。")
+                ]
+            }
+            proposals.append(Proposal(operation: .skip, evidenceIDs: skipEvidence.map(\.id), reason: "临时测试记录"))
+            let submitted = try submitViaMCP(batch, proposals: proposals, store: store)
+            expectEqual(submitted.status, "submitted")
+            expectEqual(submitted.batchID, batch.id)
+            expectTrue(submitted.message.contains("继续领取下一批"))
+            if expected == 8 {
+                expectEqual(submitted.decisions.map(\.status), ["applied", "review", "skipped"])
+                expectTrue(submitted.message.contains("计入待确认"))
+            }
         }
         let empty = try Wire.decode([String: String].self, MCPTools.handle(claim, store: store))
         expectEqual(empty["status"], "empty")
+        expectEqual(try store.dashboard().decisions.map(\.status), ["review"])
         expectEqual(try store.dashboard().evidence.map(\.id), [later.id])
+
+        let laterBatch = try unwrap(store.getBatch())
+        expectEqual(laterBatch.evidence.map(\.id), [later.id])
+        expectEqual(try store.dashboard().pending, 1)
+        expectNil(try store.dashboard().queuedThrough)
+        struct HeldQueue: Decodable {
+            let status: String
+            let claimedCount: Int
+            let message: String
+        }
+        let freshClaim = try Wire.data(["name": "dream_get_batch"])
+        let held = try Wire.decode(HeldQueue.self, MCPTools.handle(freshClaim, store: store))
+        expectEqual(held.status, "empty")
+        expectEqual(held.claimedCount, 1)
+        expectTrue(held.message.contains("已被批次领取"))
+        let oldSnapshot = try Wire.decode([String: String].self, MCPTools.handle(claim, store: store))
+        expectEqual(oldSnapshot, empty)
+        let otherProjectClaim = Data(#"{"name":"dream_get_batch","arguments":{"project":"/tmp/unrelated"}}"#.utf8)
+        let otherProject = try Wire.decode([String: String].self, MCPTools.handle(otherProjectClaim, store: store))
+        expectEqual(otherProject, empty)
     }
 
     func testLargeMCPBatch() throws {
@@ -482,14 +655,17 @@ struct MemoryFlowTests {
             let evidence = proof(1, text: "Android release APK 使用项目签名。")
             try store.ingest([evidence])
             let batch = try unwrap(store.getBatch(project: project))
-            let proposal = add(evidence, title: "Android release APK", body: "使用项目签名。")
+            let body = "使用项目签名。\n参见 “Release / Signing” 章节。\n" +
+                String(repeating: "发布签名前检查 APK 构建产物与项目签名。", count: 13)
+            let proposal = add(evidence, title: "Android release APK", body: body)
             _ = try store.submit(batchID: batch.id, proposals: [proposal])
             _ = try store.submit(batchID: batch.id, proposals: [proposal])
             let memoryID = try unwrap(store.search("Android release APK", project: project).first?.id)
 
             func hook(_ prompt: String, session: String = "shared-session", socket target: URL = socket) throws -> String? {
                 let input = try Wire.data(["prompt": prompt, "cwd": project, "session_id": session])
-                return try RecallHook.output(for: input, socket: target).map { String(decoding: $0, as: UTF8.self) }
+                guard let output = try RecallHook.output(for: input, socket: target) else { return nil }
+                return try Wire.decode([String: [String: String]].self, output)["hookSpecificOutput"]?["additionalContext"]
             }
 
             let unreachable = folder.appendingPathComponent("absent.sock")
@@ -501,15 +677,18 @@ struct MemoryFlowTests {
             try CodexSetup.setRecall(true, socket: socket)
             let codexContext = try unwrap(hook(query))
             expectTrue(codexContext.contains("用户本轮要求优先"))
+            expectTrue(codexContext.count > 240)
+            expectTrue(codexContext.hasSuffix(body))
             expectPresent(codexContext.range(of: #"\[\d{4}-\d{2}-\d{2}\]"#, options: .regularExpression))
             expectNil(try hook(newPrompt))
-            expectPresent(try hook(query, session: "another-session"))
+            let newSessionContext = try unwrap(hook(query, session: "another-session"))
 
             // An identical thread ID from another host has its own recall state.
             try AntigravitySetup.setRecall(true, socket: socket)
             let antigravityInput = try Wire.data(["lastUserInput": query, "cwd": project, "conversationId": "shared-session"])
             let antigravity = try RecallHook.antigravityOutput(for: antigravityInput, socket: socket)
-            expectTrue(String(decoding: antigravity, as: UTF8.self).contains("injectSteps"))
+            let antigravitySteps = try Wire.decode([String: [[String: [String: String]]]].self, antigravity)
+            let antigravityContext = try unwrap(antigravitySteps["injectSteps"]?.first?["systemMessage"]?["systemMessage"])
 
             let update = proof(2, text: "Android release APK 改用新版签名。")
             try store.ingest([update])
@@ -518,11 +697,12 @@ struct MemoryFlowTests {
                                 project: project, title: "Android release APK", body: "改用新版签名。",
                                 memoryID: memoryID, expectedVersion: 1)
             _ = try store.submit(batchID: editBatch.id, proposals: [edit])
-            expectTrue(try unwrap(hook(newPrompt)).contains("改用新版签名"))
+            let updatedContext = try unwrap(hook(newPrompt))
+            expectTrue(updatedContext.contains("改用新版签名"))
             for turn in 1...12 {
                 expectNil(try hook("Android release APK 如何发布 第 \(turn) 轮"))
             }
-            expectPresent(try hook("Android release APK 如何发布 第 13 轮"))
+            let laterContext = try unwrap(hook("Android release APK 如何发布 第 13 轮"))
             try store.undo(editBatch.id)
 
             let badRequest = try Wire.data(["name": "unknown_tool"])
@@ -538,6 +718,8 @@ struct MemoryFlowTests {
             expectEqual(events.filter { $0.kind == .search }.map(\.count), [1])
             let recalls = events.filter { $0.kind == .recall }
             expectEqual(recalls.map(\.agent), [.codex, .codex, .antigravity, .codex, .codex])
+            expectEqual(recalls.compactMap(\.message),
+                        [laterContext, updatedContext, antigravityContext, newSessionContext, codexContext])
             for event in recalls {
                 expectEqual(event.memoryIDs, [memoryID])
                 expectEqual(event.project, ProjectIdentity.resolve(project))
@@ -552,6 +734,26 @@ struct MemoryFlowTests {
             expectPresent(memory.lastHitAt)
             expectEqual(memory.version, 3)
         }
+    }
+
+    func testMemoryBatchLookup() throws {
+        let store = try MemoryStore(path: ":memory:")
+        let activeTitle = "SVG 画布坐标"
+        let archivedTitle = "SQLite 日志轮转"
+        try seedMemories([(activeTitle, "原点位于左上角。"), (archivedTitle, "核对检查点。")], in: store)
+        let ids = Dictionary(uniqueKeysWithValues: try store.search("").map { ($0.memory.title, $0.id) })
+        let activeID = try unwrap(ids[activeTitle])
+        let archivedID = try unwrap(ids[archivedTitle])
+        let archived = try store.setMemoryArchived(id: archivedID, archived: true)
+        let idsInOrder = [archivedID, "missing", activeID, archivedID]
+        let found = try store.memories(ids: idsInOrder)
+        expectEqual(found.map(\.id), [archivedID, activeID, archivedID])
+        expectEqual(found.map(\.title), [archivedTitle, activeTitle, archivedTitle])
+        expectEqual(found.map(\.archived), [true, false, true])
+        expectEqual(found.first?.version, archived.version)
+        expectTrue(try store.memories(ids: []).isEmpty)
+        try store.deleteArchivedMemory(id: archivedID)
+        expectEqual(try store.memories(ids: idsInOrder).map(\.id), [activeID])
     }
 
     func testRecallIgnoresGenericQuestionsAndFindsSpecificMemories() throws {
@@ -716,22 +918,24 @@ struct MemoryFlowTests {
             ])
             memoryID = try unwrap(store.search("").first?.id)
         }
-        // Restore the exact pre-Wave-2 columns and JSON shape before opening the old DB.
+        // Restore the pre-Wave-2 columns and JSON shape before opening the old DB.
         try executeSQLite("""
             DROP TRIGGER vector_revision_insert;
             DROP TRIGGER vector_revision_update;
             DROP TRIGGER vector_revision_delete;
             DROP TABLE vector_revision;
             DROP INDEX memory_health_age;
+            DROP INDEX memory_archive_recent;
             DROP INDEX decision_batch_status;
             DROP INDEX history_batch;
             ALTER TABLE memory DROP COLUMN hit_count;
             ALTER TABLE memory DROP COLUMN last_hit_at;
             ALTER TABLE memory DROP COLUMN content_version;
             ALTER TABLE batch DROP COLUMN created_at;
+            ALTER TABLE batch DROP COLUMN has_deleted_memory;
             UPDATE memory SET payload = CAST(json_remove(CAST(payload AS TEXT), '$.hitCount', '$.lastHitAt') AS BLOB);
             UPDATE history SET current = CAST(json_remove(CAST(current AS TEXT), '$.hitCount', '$.lastHitAt') AS BLOB);
-            DELETE FROM grdb_migrations WHERE identifier = 'memory_health_and_inspection';
+            DELETE FROM grdb_migrations WHERE identifier IN ('memory_health_and_inspection', 'archived_memory_deletion');
             """, path: path)
         let store = try MemoryStore(path: path)
         let migrated = try unwrap(store.memory(id: memoryID))
@@ -842,6 +1046,198 @@ struct MemoryFlowTests {
         try store.undo(archiveBatch.id)
         expectTrue((try store.inspectSearch(title + "\n" + newBody, scope: .project(project)).hits.first?.vector ?? 0) > 0.99)
         expectEqual(try store.memoryHealthSummary().activeCount, 3)
+    }
+
+    func testManualMemoryArchiveAndRestore() throws {
+        let store = try MemoryStore(path: ":memory:")
+        let title = "APK release signing"
+        let body = "Use the existing release signature."
+        let query = title + " " + body
+        let otherProject = "/tmp/am-archive-other-project"
+        let sources = [proof(1, text: query), proof(2, text: query, project: otherProject)]
+        try store.ingest(sources)
+        let originalBatch = try unwrap(store.getBatch())
+        let proposals = sources.map { add($0, title: title, body: body) }
+        let initial = try store.submit(batchID: originalBatch.id, proposals: proposals)
+        expectEqual(initial.decisions.map(\.status), ["applied", "applied"])
+
+        let original = try unwrap(store.search(query, project: project).first?.memory)
+        let other = try unwrap(store.search(query, project: otherProject).first?.memory)
+        let active = try store.memoryHealthSummary()
+        expectEqual(active.activeCount, 2)
+        expectEqual(active.archivedCount, 0)
+        let pair = try unwrap(active.duplicatePairs.first)
+        expectEqual(Set([pair.memoryAID, pair.memoryBID]), Set([original.id, other.id]))
+
+        let archived = try store.setMemoryArchived(id: original.id, archived: true)
+        expectTrue(archived.archived)
+        expectEqual(archived.version, original.version + 1)
+        expectTrue(archived.updated > original.updated)
+        expectEqual(archived.evidenceIDs, original.evidenceIDs)
+        expectEqual(try store.memory(id: original.id)?.archived, true)
+        expectTrue(try store.search(query, project: project).isEmpty)
+        expectEqual(try store.search(query).map(\.id), [other.id])
+        let afterArchive = try store.memoryHealthSummary()
+        expectEqual(afterArchive.activeCount, 1)
+        expectEqual(afterArchive.archivedCount, 1)
+        expectTrue(afterArchive.duplicatePairs.isEmpty)
+        expectFalse(try store.memoryGraph().nodes.contains { $0.id == original.id })
+
+        let restored = try store.setMemoryArchived(id: original.id, archived: false)
+        expectFalse(restored.archived)
+        expectEqual(restored.version, archived.version + 1)
+        expectTrue(restored.updated > archived.updated)
+        expectEqual(try store.memory(id: original.id)?.archived, false)
+        let searchHit = try unwrap(store.search(query, project: project).first)
+        expectEqual(searchHit.id, original.id)
+        expectPresent(searchHit.keywordRank)
+        expectPresent(searchHit.vector)
+        let afterRestore = try store.memoryHealthSummary()
+        expectEqual(afterRestore, active)
+        expectTrue(try store.memoryGraph().nodes.contains { $0.id == original.id })
+        expectEqual(try store.memory(id: original.id, version: original.version)?.archived, false)
+        expectEqual(try store.memory(id: original.id, version: archived.version)?.archived, true)
+
+        do {
+            _ = try store.setMemoryArchived(id: "missing", archived: true)
+            fatalError("不存在的记忆应抛出错误")
+        } catch let error as MemoryError {
+            expectEqual(error.errorDescription, "记忆不存在。")
+        }
+    }
+
+    func testArchivedMemoryQuery() throws {
+        let store = try MemoryStore(path: ":memory:")
+        let olderTitle = "ÉTALON 发布手册"
+        let newerTitle = "调温记录"
+        let activeTitle = "Étalon 校验"
+        try seedMemories([
+            (olderTitle, "冷机预热至目标值。"),
+            (newerTitle, "湿度保持在 50% 以内，记录 Delta 值。"),
+            (activeTitle, "此条仍在使用。")
+        ], in: store)
+        let ids = Dictionary(uniqueKeysWithValues: try store.search("").map { ($0.memory.title, $0.id) })
+        let olderID = try unwrap(ids[olderTitle])
+        let newerID = try unwrap(ids[newerTitle])
+        _ = try store.setMemoryArchived(id: olderID, archived: true)
+        _ = try store.setMemoryArchived(id: newerID, archived: true)
+
+        expectEqual(try store.archivedMemories().map(\.id), [newerID, olderID])
+        expectEqual(try store.archivedMemories(limit: 1).map(\.id), [newerID])
+        expectEqual(try store.archivedMemories(query: "étalon", limit: 1).map(\.id), [olderID])
+        expectEqual(try store.archivedMemories(query: "dELTa").map(\.id), [newerID])
+        expectEqual(try store.archivedMemories(query: "%").map(\.id), [newerID])
+        expectTrue(try store.archivedMemories(query: "校验").isEmpty)
+        expectTrue(try store.archivedMemories(limit: 0).isEmpty)
+        _ = try store.setMemoryArchived(id: newerID, archived: false)
+        expectEqual(try store.archivedMemories().map(\.id), [olderID])
+    }
+
+    func testPermanentArchiveDeletion() throws {
+        try withRecallDatabase { store, path in
+            let title = "琉璃窑温曲线"
+            let retainedTitle = "PDF 页边距"
+            let first = proof(1, text: title)
+            let second = proof(2, text: retainedTitle)
+            try store.ingest([first, second])
+            let batch = try unwrap(store.getBatch(project: project))
+            let original = try store.submit(batchID: batch.id, proposals: [
+                add(first, title: title, body: "分段记录升温。"),
+                add(second, title: retainedTitle, body: "保持左右留白一致。")
+            ])
+            expectEqual(original.decisions.map(\.status), ["applied", "applied"])
+            let ids = Dictionary(uniqueKeysWithValues: try store.search("").map { ($0.memory.title, $0.id) })
+            let deletedID = try unwrap(ids[title])
+            let retainedID = try unwrap(ids[retainedTitle])
+            for id in [deletedID, "missing"] {
+                do {
+                    try store.deleteArchivedMemory(id: id)
+                    fatalError("活跃或不存在的记忆不可永久删除")
+                } catch MemoryError.invalid(let message) {
+                    expectTrue(message.contains("仅支持永久删除已归档记忆"))
+                }
+            }
+            _ = try store.setMemoryArchived(id: deletedID, archived: true)
+            // Simulate a stale FTS entry and a failure after the auxiliary tables were changed.
+            try executeSQLite("""
+                INSERT INTO memory_fts (id,title,body) VALUES ('\(deletedID)','stale','index');
+                CREATE TRIGGER abort_archived_delete BEFORE DELETE ON memory BEGIN
+                    SELECT RAISE(ABORT, 'test deletion rollback');
+                END
+                """, path: path)
+            let evidenceBefore = try querySQLite("SELECT state || ':' || hex(payload) FROM evidence WHERE id = 'proof-1'", path: path)
+            let activities = try store.recentActivities().map(\.id)
+            expectError(try store.deleteArchivedMemory(id: deletedID))
+            expectEqual(try store.memory(id: deletedID)?.archived, true)
+            expectEqual(try store.history(deletedID).count, 2)
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM memory_fts WHERE id = '\(deletedID)'", path: path), "1")
+            expectEqual(try querySQLite("SELECT has_deleted_memory FROM batch WHERE id = '\(batch.id)'", path: path), "0")
+            expectEqual(try store.recentActivities().map(\.id), activities)
+            try executeSQLite("DROP TRIGGER abort_archived_delete", path: path)
+
+            try store.deleteArchivedMemory(id: deletedID)
+            expectNil(try store.memory(id: deletedID))
+            expectNil(try store.memory(id: deletedID, version: 1))
+            expectTrue(try store.history(deletedID).isEmpty)
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM memory_fts WHERE id = '\(deletedID)'", path: path), "0")
+            expectEqual(try querySQLite("SELECT state || ':' || hex(payload) FROM evidence WHERE id = 'proof-1'", path: path),
+                        evidenceBefore)
+            expectTrue(evidenceBefore.hasPrefix("done:"))
+            expectEqual(try store.ingest([first]), 0)
+            expectNil(try store.getBatch(project: project))
+
+            let audit = try unwrap(store.recentActivities().first)
+            expectEqual(audit.memoryIDs, [deletedID])
+            expectEqual(audit.count, 1)
+            expectEqual(audit.message, "已永久删除归档记忆")
+            expectEqual(try store.dreamBatchSummaries().first?.canRollback, false)
+            expectError(try store.undo(batch.id))
+            expectEqual(try store.memory(id: retainedID)?.archived, false)
+            expectEqual(try store.memory(id: retainedID)?.version, 1)
+            expectEqual(try store.history(retainedID).count, 1)
+        }
+    }
+
+    func testBulkArchiveAndDeletion() throws {
+        try withRecallDatabase { store, path in
+            let titles = ["SVG 路径", "SQLite 检查点", "无损音频编码", "视频白平衡"]
+            try seedMemories([
+                (titles[0], "统一描边宽度。"),
+                (titles[1], "写入完成后执行检查点。"),
+                (titles[2], "输出 FLAC。"),
+                (titles[3], "拍摄前使用灰卡。")
+            ], in: store)
+            let ids = Dictionary(uniqueKeysWithValues: try store.search("").map { ($0.memory.title, $0.id) })
+            let firstID = try unwrap(ids[titles[0]])
+            let secondID = try unwrap(ids[titles[1]])
+            let alreadyArchived = try unwrap(ids[titles[2]])
+            let keptID = try unwrap(ids[titles[3]])
+            _ = try store.setMemoryArchived(id: alreadyArchived, archived: true)
+            _ = try store.memoryHealthSummary()
+            let revision = try querySQLite("SELECT revision FROM vector_revision", path: path)
+
+            expectEqual(try store.archiveMemories(ids: [firstID, secondID, firstID, alreadyArchived, "missing"]), 2)
+            expectEqual(try store.archiveMemories(ids: [firstID, secondID]), 0)
+            expectEqual(try store.memory(id: alreadyArchived)?.version, 2)
+            let archived = try store.archivedMemories()
+            expectEqual(Set(archived.map(\.id)), Set([firstID, secondID, alreadyArchived]))
+            expectEqual(try querySQLite("SELECT revision - \(revision) FROM vector_revision", path: path), "2")
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM memory_fts", path: path), "1")
+            expectEqual(try store.memoryHealthSummary().activeCount, 1)
+            expectEqual(try store.memoryHealthSummary().archivedCount, 3)
+
+            expectEqual(try store.deleteAllArchivedMemories(), 3)
+            expectEqual(try store.deleteAllArchivedMemories(), 0)
+            expectTrue(try store.archivedMemories().isEmpty)
+            expectEqual(try store.search("").map(\.id), [keptID])
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM memory_fts", path: path), "1")
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM history", path: path), "1")
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM evidence WHERE state = 'done'", path: path), "4")
+            expectEqual(try store.memoryHealthSummary().archivedCount, 0)
+            let audit = try unwrap(store.recentActivities().first)
+            expectEqual(audit.count, 3)
+            expectEqual(audit.message, "已永久清空 3 条归档记忆")
+        }
     }
 
     func testDreamBatchSummariesAndLookups() throws {
@@ -1039,6 +1435,309 @@ struct MemoryFlowTests {
     private struct StoredVector: Codable {
         let model: String
         let values: [Float]
+    }
+
+    func testProjectMigrationMovesLiveDataAndPreservesSnapshots() throws {
+        try withProjectMigrationDatabase { store, directory, path in
+            let source = directory.appendingPathComponent("Old project").path
+            let target = directory.appendingPathComponent("New project").path
+            let child = source + "/nested"
+            let first = proof(1, text: "琉璃菜单快捷键", project: source)
+            let second = proof(2, text: "紫铜焊接温度", project: source)
+            let third = proof(3, text: "再次核对琉璃菜单快捷键", project: source)
+            let queued = proof(4, text: "陶瓷釉料检验", project: source)
+            let excluded = proof(5, text: "排除测试", project: source)
+            let existing = proof(6, text: "保留目标项目的队列", project: target)
+            let nested = proof(7, text: "保留子路径的队列", project: child)
+            try store.ingest([first, second, third, queued, excluded, existing, nested])
+            try store.exclude(excluded, project: false)
+
+            let initialBatch = try unwrap(store.getBatch(project: source, limit: 2))
+            let firstProposal = add(first, title: "琉璃菜单快捷键", body: "按组合键打开琉璃菜单。")
+            let secondProposal = add(second, title: "紫铜焊接温度", body: "焊接前校准温控探针。")
+            let initial = try store.submit(batchID: initialBatch.id, proposals: [firstProposal, secondProposal])
+            expectEqual(initial.decisions.map(\.status), ["applied", "applied"])
+            let active = try unwrap(store.search(firstProposal.title ?? "", project: source).first?.memory)
+            let archivedID = try unwrap(store.search(secondProposal.title ?? "", project: source).first?.id)
+            let archived = try store.setMemoryArchived(id: archivedID, archived: true)
+            try executeSQLite("UPDATE memory SET hit_count = 9, last_hit_at = 1234 WHERE id = '\(active.id)'", path: path)
+
+            let reviewBatch = try unwrap(store.getBatch(project: source, limit: 1))
+            let review = try unwrap(store.submit(
+                batchID: reviewBatch.id,
+                proposals: [add(third, title: active.title, body: "核对菜单组合键。")]
+            ).decisions.first)
+            expectEqual(review.status, "review")
+            let before = try store.projectSummaries()
+            expectEqual(before.map(\.project), [source, target, child])
+            expectEqual(before.map(\.activeMemoryCount), [1, 0, 0])
+            expectEqual(before.map(\.archivedMemoryCount), [1, 0, 0])
+            expectEqual(before.map(\.queuedEvidenceCount), [1, 1, 1])
+            let undoSeed = proof(8, text: "琉璃菜单快捷键", project: source)
+            try store.ingest([undoSeed])
+            // Submitting the update requeues the other evidence in the batch.
+            let updateBatch = try unwrap(store.getBatch(project: source, limit: 2))
+            let update = Proposal(operation: .update, evidenceIDs: [undoSeed.id], reason: "增加菜单说明",
+                                  scope: "project", project: source, title: active.title, body: "按两次组合键打开琉璃菜单。",
+                                  memoryID: active.id, expectedVersion: active.version)
+            expectEqual(try store.submit(batchID: updateBatch.id, proposals: [update]).decisions.first?.status, "applied")
+            let current = try unwrap(store.memory(id: active.id))
+            let preview = try store.previewProjectMigration(from: source + "/.", to: target + "/")
+            expectEqual(preview.fromProject, source)
+            expectEqual(preview.toProject, target)
+            expectEqual([preview.activeMemoryCount, preview.archivedMemoryCount, preview.queuedEvidenceCount,
+                         preview.doneEvidenceCount, preview.claimedEvidenceCount], [1, 1, 1, 4, 0])
+            expectError(try store.previewProjectMigration(from: "relative", to: target))
+            expectError(try store.migrateProject(from: source, to: source + "/."))
+
+            func memoryFields() throws -> String {
+                try querySQLite("""
+                    SELECT group_concat(body, '|') FROM (
+                        SELECT id || ':' || content_version || ':' || archived || ':' || updated || ':' ||
+                               hit_count || ':' || ifnull(last_hit_at, '') || ':' || hex(vectors) || ':' ||
+                               json_remove(CAST(payload AS TEXT), '$.project') AS body FROM memory ORDER BY id
+                    )
+                    """, path: path)
+            }
+            func evidenceFields() throws -> String {
+                try querySQLite("""
+                    SELECT group_concat(body, '|') FROM (
+                        SELECT rowid || ':' || id || ':' || state || ':' ||
+                               json_remove(CAST(payload AS TEXT), '$.project') AS body FROM evidence ORDER BY rowid
+                    )
+                    """, path: path)
+            }
+            let previousMemoryFields = try memoryFields()
+            let previousEvidenceFields = try evidenceFields()
+            let audit = try projectMigrationAudit(path)
+            let revision = try querySQLite("SELECT revision FROM vector_revision", path: path)
+            let activityCount = try querySQLite("SELECT COUNT(*) FROM activity_log", path: path)
+            _ = try store.memoryHealthSummary()
+            expectEqual(try store.memoryGraph().nodes.first?.project, source)
+
+            try executeSQLite("""
+                CREATE TRIGGER reject_project_update BEFORE UPDATE OF project ON evidence BEGIN
+                    SELECT RAISE(ABORT, 'test migration rollback');
+                END
+                """, path: path)
+            expectError(try store.migrateProject(from: source, to: target))
+            expectEqual(try store.previewProjectMigration(from: source, to: target), preview)
+            expectEqual(try store.memory(id: active.id)?.project, source)
+            expectEqual(try store.evidence([queued.id]).first?.project, source)
+            expectEqual(try querySQLite("SELECT revision FROM vector_revision", path: path), revision)
+            expectEqual(try querySQLite("SELECT COUNT(*) FROM activity_log", path: path), activityCount)
+            try executeSQLite("DROP TRIGGER reject_project_update", path: path)
+
+            let result = try store.migrateProject(from: source, to: target)
+            expectEqual(result.fromProject, source)
+            expectEqual(result.toProject, target)
+            expectEqual(result.migratedMemoryCount, 2)
+            expectEqual(result.migratedEvidenceCount, 6)
+            for (table, id) in [("memory", active.id), ("memory", archived.id), ("evidence", queued.id), ("evidence", excluded.id)] {
+                expectEqual(try querySQLite("""
+                    SELECT project || '|' || json_extract(CAST(payload AS TEXT), '$.project')
+                    FROM \(table) WHERE id = '\(id)'
+                    """, path: path), "\(target)|\(target)")
+            }
+            expectEqual(try memoryFields(), previousMemoryFields)
+            expectEqual(try evidenceFields(), previousEvidenceFields)
+            expectEqual(try projectMigrationAudit(path), audit)
+            expectEqual(try querySQLite("SELECT revision - \(revision) FROM vector_revision", path: path), "1")
+            let migration = try unwrap(store.recentActivities().first)
+            expectEqual(migration.project, target)
+            expectEqual(migration.count, 8)
+            expectEqual(migration.message, "从 \(source) 迁移到 \(target)（记忆 2 条，证据 6 条）")
+            let summaries = try store.projectSummaries()
+            expectEqual(summaries.map(\.project), [target, child])
+            expectEqual(summaries.map(\.queuedEvidenceCount), [2, 1])
+            expectEqual(try store.memoryGraph().nodes.first?.project, target)
+
+            struct SearchOutput: Decodable { let hits: [SearchHit] }
+            func search(_ project: String) throws -> [SearchHit] {
+                let request = try JSONSerialization.data(withJSONObject: [
+                    "name": "memory_search", "arguments": ["query": active.title, "project": project]
+                ])
+                let response = try MCPTools.handle(request, store: store)
+                let decoded = try Wire.decode(SearchOutput.self, response)
+                return decoded.hits
+            }
+            expectEqual(try search(target).first?.id, active.id)
+            expectTrue(try search(source).isEmpty)
+            expectEqual(try store.memory(id: active.id)?.version, current.version)
+            expectEqual(try store.memory(id: active.id)?.hitCount, current.hitCount + 1)
+            expectEqual(try store.ingest([queued, excluded]), 0)
+
+            let claim = try JSONSerialization.data(withJSONObject: [
+                "name": "dream_get_batch", "arguments": ["project": target, "limit": 1]
+            ])
+            let migratedBatch = try Wire.decode(DreamBatch.self, MCPTools.handle(claim, store: store))
+            let migratedEvidence = try unwrap(migratedBatch.evidence.first)
+            expectEqual(migratedEvidence.id, queued.id)
+            expectEqual(migratedEvidence.project, target)
+            let proposal = add(migratedEvidence, title: "陶瓷釉料检验", body: "恒温静置后记录釉料黏度。")
+            let submission = try JSONSerialization.data(withJSONObject: [
+                "name": "dream_submit",
+                "arguments": ["batchID": migratedBatch.id, "proposals": JSONSerialization.jsonObject(with: Wire.data([proposal]))]
+            ])
+            let written = try Wire.decode(Submission.self, MCPTools.handle(submission, store: store))
+            expectEqual(written.decisions.first?.status, "applied")
+            expectEqual(try store.search("陶瓷釉料检验", project: target).first?.memory.project, target)
+
+            try store.review(review.id, accept: true)
+            try store.undo(updateBatch.id)
+            expectEqual(try store.memory(id: active.id)?.project, target)
+            expectEqual(try store.memory(id: active.id)?.body, active.body)
+            expectTrue(try store.projectSummaries().allSatisfy { $0.project != source })
+            let activitiesBeforeRetry = try store.recentActivities().map(\.id)
+            let retry = try store.migrateProject(from: source, to: target)
+            expectEqual(retry.migratedMemoryCount + retry.migratedEvidenceCount, 0)
+            expectEqual(try store.recentActivities().map(\.id), activitiesBeforeRetry)
+        }
+    }
+
+    func testProjectMigrationProtectsClaimedBatches() throws {
+        try withProjectMigrationDatabase { store, directory, path in
+            let source = directory.appendingPathComponent("old").path
+            let target = directory.appendingPathComponent("new").path
+            let other = directory.appendingPathComponent("other").path
+            try store.ingest([
+                proof(1, text: "过期批次证据", project: source),
+                proof(2, text: "进行中批次证据", project: source),
+                proof(3, text: "其他项目证据", project: other)
+            ])
+            let expired = try unwrap(store.getBatch(project: source, limit: 1))
+            let active = try unwrap(store.getBatch(project: source, limit: 1))
+            let unrelated = try unwrap(store.getBatch(project: other))
+            try executeSQLite("UPDATE batch SET expires = 0 WHERE id IN ('\(expired.id)', '\(unrelated.id)')", path: path)
+            let before = try store.previewProjectMigration(from: source, to: target)
+            expectEqual(before.claimedEvidenceCount, 2)
+            expectEqual(try store.projectSummaries().first?.claimedEvidenceCount, 2)
+            let audit = try projectMigrationAudit(path)
+            do {
+                _ = try store.migrateProject(from: source, to: target)
+                expectTrue(false)
+            } catch MemoryError.invalid(let message) {
+                expectTrue(message.contains("进行中的做梦批次") && message.contains("dream_release_batch"))
+            }
+            expectEqual(try store.previewProjectMigration(from: source, to: target), before)
+            expectEqual(try projectMigrationAudit(path), audit)
+
+            let release = try JSONSerialization.data(withJSONObject: [
+                "name": "dream_release_batch", "arguments": ["batchID": active.id]
+            ])
+            _ = try MCPTools.handle(release, store: store)
+            let afterRelease = try projectMigrationAudit(path)
+            let migrated = try store.migrateProject(from: source, to: target)
+            expectEqual(migrated.migratedMemoryCount, 0)
+            expectEqual(migrated.migratedEvidenceCount, 2)
+            expectEqual(try store.previewProjectMigration(from: target, to: source).queuedEvidenceCount, 2)
+            expectEqual(try querySQLite("SELECT state FROM evidence WHERE id = 'proof-3'", path: path), "claimed")
+            expectEqual(try projectMigrationAudit(path), afterRelease)
+        }
+    }
+
+    func testProjectMigrationCLI() throws {
+        try withProjectMigrationDatabase { store, directory, _ in
+            let source = directory.appendingPathComponent("google antigravity").path
+            let target = directory.appendingPathComponent("Wang's destination").path
+            let socket = directory.appendingPathComponent("migration socket")
+            let server = try LocalToolServer(store: store, path: socket)
+            try withExtendedLifetime(server) {
+                let item = proof(1, text: "CLI 路径保留空格", project: source)
+                try store.ingest([item])
+                let arguments = ["--from", source, "--to", target]
+                let output = try ProjectMigrationCommand.run(arguments: ["--dry-run"] + arguments, socket: socket)
+                let preview = try Wire.decode(ProjectMigrationPreview.self, output)
+                expectEqual(preview.fromProject, source)
+                expectEqual(preview.toProject, target)
+                expectEqual(preview.queuedEvidenceCount, 1)
+                expectEqual(try store.evidence([item.id]).first?.project, source)
+                expectError(try ProjectMigrationCommand.run(arguments: ["--from", source], socket: socket))
+                expectError(try ProjectMigrationCommand.run(arguments: arguments + ["--unknown"], socket: socket))
+                expectError(try ProjectMigrationCommand.run(arguments: ["--from", "relative", "--to", target], socket: socket))
+                expectFalse(MCPTools.definitions.contains { ($0["name"] as? String)?.contains("migrate") == true })
+
+                func launch(_ command: String) throws -> (status: Int32, output: Data, error: String) {
+                    let child = Process()
+                    child.executableURL = URL(fileURLWithPath: "/bin/sh")
+                    child.arguments = ["-c", command]
+                    let stdout = Pipe()
+                    let stderr = Pipe()
+                    child.standardOutput = stdout
+                    child.standardError = stderr
+                    try child.run()
+                    child.waitUntilExit()
+                    return (child.terminationStatus, stdout.fileHandleForReading.readDataToEndOfFile(),
+                            String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+                }
+                let probe = directory.appendingPathComponent("probe executable")
+                try Data("#!/bin/sh\nprintf '%s\\n' \"$AGENT_MEMORY_SOCKET\" \"$@\"\n".utf8).write(to: probe)
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: probe.path)
+                let quoted = try launch(ProjectMigrationCommand.shellCommand(from: source, to: target,
+                                                                              executable: probe.path, socket: socket))
+                expectEqual(quoted.status, 0)
+                let emitted = String(decoding: quoted.output, as: UTF8.self).split(separator: "\n").map(String.init)
+                expectEqual(emitted, [socket.path, "--migrate-project"] + arguments)
+
+                // A standalone swift run need only build the smoke product.
+                let cli = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+                    .deletingLastPathComponent().appendingPathComponent("agent-memory-mcp")
+                let result: Data
+                if FileManager.default.isExecutableFile(atPath: cli.path) {
+                    let command = ProjectMigrationCommand.shellCommand(from: source, to: target,
+                                                                      executable: cli.path, socket: socket)
+                    let dryRun = try launch(command + " --dry-run")
+                    expectEqual(dryRun.status, 0)
+                    expectEqual(try Wire.decode(ProjectMigrationPreview.self, dryRun.output), preview)
+                    expectEqual(dryRun.error, "")
+                    let invalid = try launch(command + " --unknown")
+                    expectEqual(invalid.status, 1)
+                    expectTrue(invalid.output.isEmpty && invalid.error.contains("用法"))
+                    let claimed = try unwrap(store.getBatch(project: source))
+                    let blocked = try launch(command)
+                    expectEqual(blocked.status, 1)
+                    expectTrue(blocked.output.isEmpty && blocked.error.contains("dream_release_batch"))
+                    let release = try JSONSerialization.data(withJSONObject: [
+                        "name": "dream_release_batch", "arguments": ["batchID": claimed.id]
+                    ])
+                    _ = try MCPTools.handle(release, store: store)
+                    let execution = try launch(command)
+                    expectEqual(execution.status, 0)
+                    result = execution.output
+                } else {
+                    result = try ProjectMigrationCommand.run(arguments: arguments, socket: socket)
+                }
+                expectEqual(try Wire.decode(ProjectMigrationResult.self, result).migratedEvidenceCount, 1)
+                expectEqual(try store.evidence([item.id]).first?.project, target)
+            }
+        }
+    }
+
+    private func withProjectMigrationDatabase(_ action: (MemoryStore, URL, String) throws -> Void) throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/am-" + String(UUID().uuidString.prefix(10)))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("db").path
+        try action(MemoryStore(path: path), directory, path)
+    }
+
+    private func projectMigrationAudit(_ path: String) throws -> [String] {
+        try [
+            querySQLite("""
+                SELECT coalesce(group_concat(id || ':' || batch_id || ':' || hex(previous) || ':' || hex(current), '|'), '')
+                FROM (SELECT * FROM history ORDER BY id)
+                """, path: path),
+            querySQLite("""
+                SELECT coalesce(group_concat(id || ':' || expires || ':' || created_at || ':' || hex(payload) || ':' ||
+                                             hex(submission) || ':' || hex(response) || ':' || reversed, '|'), '')
+                FROM (SELECT * FROM batch ORDER BY id)
+                """, path: path),
+            querySQLite("""
+                SELECT coalesce(group_concat(id || ':' || batch_id || ':' || status || ':' || hex(payload), '|'), '')
+                FROM (SELECT * FROM decision ORDER BY id)
+                """, path: path)
+        ]
     }
 
     private func storedVector(for memoryID: String, path: String) throws -> StoredVector {
